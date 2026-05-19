@@ -3,15 +3,28 @@
 #include <cstdint>
 
 namespace SteamLocator {
-    // Base address of steamclient64.dll (waits up to 10s for it to load).
-    // Returns nullptr if not loaded within that window.
     HMODULE WaitForSteamClient(int maxMs);
-
-    // Searches steamclient64.dll for the RTTI type string
-    // ".?AVCClientUnifiedServiceTransport@@". Returns its address or nullptr.
-    // Logs progress to %TEMP%\crbridge.log.
     const void* FindServiceTransportRttiString();
 
-    // Runs the full Iteration 3 diagnostic. Returns true if the RTTI string was found.
-    bool Diagnose();
+    // === Iteration 4: RTTI walk ===
+
+    // Returns address of the TypeDescriptor enclosing the given RTTI name string.
+    const void* TypeDescriptorFromName(const void* nameAddr);
+
+    // Scans steamclient64.dll for Complete Object Locators referencing the given
+    // TypeDescriptor. Writes up to maxResults addresses into outResults.
+    // Returns the number of COLs found.
+    int FindColsReferencingTypeDescriptor(HMODULE module, const void* typeDescriptor,
+                                          const void** outResults, int maxResults);
+
+    // Scans steamclient64.dll for a vtable whose -8 offset (a "RTTI pointer slot")
+    // points to the given COL. Returns the vtable address (right after the slot)
+    // or nullptr if not found.
+    const void* FindVtableForCol(HMODULE module, const void* col);
+
+    // Logs the first n slots of the given vtable.
+    void DumpVtable(const void* vtable, int n);
+
+    // Runs the full Iteration 4 diagnostic.
+    bool DiagnoseRTTI();
 }
