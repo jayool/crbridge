@@ -11,6 +11,7 @@ endif()
 
 add_library(crbridge SHARED
     src/dllmain.cpp
+    src/cr_loader.cpp
 )
 
 # Static MSVC runtime so the DLL has no external CRT dependency at runtime
