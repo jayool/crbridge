@@ -1,7 +1,7 @@
 #include "steam_locator.h"
+#include "vtable_hook.h"
 #include <cstdio>
 #include <cstring>
-#include "vtable_hook.h"
 
 namespace {
 
@@ -110,10 +110,6 @@ const void* FindServiceTransportRttiString() {
 }
 
 const void* TypeDescriptorFromName(const void* nameAddr) {
-    // On MSVC x64, TypeDescriptor:
-    //   +0x00 pVFTable    (8 bytes)
-    //   +0x08 spare       (8 bytes)
-    //   +0x10 name[]      (the string we found)
     return reinterpret_cast<const uint8_t*>(nameAddr) - 16;
 }
 
@@ -137,21 +133,13 @@ int FindColsReferencingTypeDescriptor(HMODULE module, const void* typeDescriptor
         PESection sec = {};
         if (!FindSection(module, secName, &sec)) continue;
 
-        // COL is 24 bytes on x64. Scan 4-byte aligned.
-        // COL layout (DWORDs):
-        //   [0] signature        (must be 1 for x64)
-        //   [1] offset
-        //   [2] cdOffset
-        //   [3] pTypeDescriptor  (RVA)  ← we want this == tdRva
-        //   [4] pClassDescriptor (RVA)
-        //   [5] pSelf            (RVA of this COL itself)  ← validate
         const uint8_t* end = sec.base + sec.size;
         for (const uint8_t* p = sec.base; p + 24 <= end; p += 4) {
             const uint32_t* col = reinterpret_cast<const uint32_t*>(p);
-            if (col[0] != 1) continue;          // x64 signature
-            if (col[3] != tdRva) continue;      // points to our TypeDescriptor
+            if (col[0] != 1) continue;
+            if (col[3] != tdRva) continue;
             uint32_t selfRva = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p) - base);
-            if (col[5] != selfRva) continue;    // self-reference matches
+            if (col[5] != selfRva) continue;
 
             snprintf(buf, sizeof(buf),
                 "RTTI: COL #%d found at %p (section %s)", found, (void*)p, secName);
@@ -178,7 +166,6 @@ const void* FindVtableForCol(HMODULE module, const void* col) {
         PESection sec = {};
         if (!FindSection(module, secName, &sec)) continue;
         const uint8_t* end = sec.base + sec.size;
-        // Scan 8-byte aligned for an absolute pointer == colAddr
         for (const uint8_t* p = sec.base; p + 16 <= end; p += 8) {
             uintptr_t value;
             memcpy(&value, p, sizeof(value));
@@ -205,7 +192,6 @@ void DumpVtable(const void* vtable, int n) {
         uintptr_t fnAddr = p[i];
         char hexBuf[80] = {};
 
-        // Filter out garbage entries (must look like a code pointer)
         MEMORY_BASIC_INFORMATION mbi = {};
         bool readable = false;
         if (VirtualQuery(reinterpret_cast<LPCVOID>(fnAddr), &mbi, sizeof(mbi)) == sizeof(mbi)) {
@@ -233,6 +219,90 @@ void DumpVtable(const void* vtable, int n) {
     }
 }
 
+const void* FindPattern(const uint8_t* haystack, size_t haystackSize,
+                        const char* pattern) {
+    uint8_t bytes[512] = {};
+    bool mask[512] = {};
+    int n = 0;
+
+    auto hexVal = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return -1;
+    };
+
+    const char* p = pattern;
+    while (*p && n < 512) {
+        while (*p == ' ') ++p;
+        if (!*p) break;
+        if (p[0] == '?' && p[1] == '?') {
+            mask[n] = false;
+            bytes[n] = 0;
+            n++;
+            p += 2;
+        } else {
+            int high = hexVal(p[0]);
+            int low = hexVal(p[1]);
+            if (high < 0 || low < 0) return nullptr;
+            bytes[n] = static_cast<uint8_t>((high << 4) | low);
+            mask[n] = true;
+            n++;
+            p += 2;
+        }
+    }
+    if (n == 0 || static_cast<size_t>(n) > haystackSize) return nullptr;
+
+    for (size_t i = 0; i + n <= haystackSize; ++i) {
+        bool match = true;
+        for (int j = 0; j < n; ++j) {
+            if (mask[j] && haystack[i + j] != bytes[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return haystack + i;
+    }
+    return nullptr;
+}
+
+const void* FindBBuildAndAsyncSendFrame() {
+    HMODULE sc = WaitForSteamClient(10000);
+    if (!sc) return nullptr;
+
+    PESection text = {};
+    if (!FindSection(sc, ".text", &text)) {
+        LogLine("BBuildAndAsync: .text section not found");
+        return nullptr;
+    }
+
+    char buf[640];
+    snprintf(buf, sizeof(buf),
+        "BBuildAndAsync: scanning .text at %p size %zu", (void*)text.base, text.size);
+    LogLine(buf);
+
+    struct Sig { const char* label; const char* pattern; };
+    const Sig sigs[] = {
+        {"1778803745 (beta)",
+         "48 8B C4 55 48 8D 68 A1 48 81 EC C0 00 00 00 48 89 70 18"},
+        {"1778281814 (stable)",
+         "48 8B C4 55 48 8D 68 A1 48 81 EC C0 00 00 00"},
+    };
+
+    for (const auto& sig : sigs) {
+        const void* found = FindPattern(text.base, text.size, sig.pattern);
+        if (found) {
+            snprintf(buf, sizeof(buf),
+                "BBuildAndAsync: FOUND at %p (sig: %s)", found, sig.label);
+            LogLine(buf);
+            return found;
+        }
+    }
+
+    LogLine("BBuildAndAsync: NO PATTERN MATCHED — need new signature for this Steam build");
+    return nullptr;
+}
+
 bool DiagnoseRTTI() {
     const void* rttiStr = FindServiceTransportRttiString();
     if (!rttiStr) return false;
@@ -253,9 +323,13 @@ bool DiagnoseRTTI() {
         const void* vtable = FindVtableForCol(sc, cols[i]);
         if (vtable) {
             DumpVtable(vtable, 16);
-            VtableHook::Install(vtable);
+            // VtableHook::Install(vtable);  // disabled — was contaminating data
         }
     }
+
+    // Iteration 7: locate BBuildAndAsyncSendFrame
+    FindBBuildAndAsyncSendFrame();
+
     return true;
 }
 
