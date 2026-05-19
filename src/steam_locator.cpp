@@ -201,8 +201,33 @@ void DumpVtable(const void* vtable, int n) {
     auto p = reinterpret_cast<const uintptr_t*>(vtable);
     char buf[640];
     for (int i = 0; i < n; ++i) {
+        uintptr_t fnAddr = p[i];
+        char hexBuf[80] = {};
+
+        // Filter out garbage entries (must look like a code pointer)
+        MEMORY_BASIC_INFORMATION mbi = {};
+        bool readable = false;
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(fnAddr), &mbi, sizeof(mbi)) == sizeof(mbi)) {
+            if (mbi.State == MEM_COMMIT &&
+                (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                 PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+                readable = true;
+            }
+        }
+
+        if (readable) {
+            const uint8_t* fn = reinterpret_cast<const uint8_t*>(fnAddr);
+            for (int j = 0; j < 16; ++j) {
+                char tmp[4];
+                snprintf(tmp, sizeof(tmp), "%02X ", fn[j]);
+                strcat_s(hexBuf, sizeof(hexBuf), tmp);
+            }
+        } else {
+            strcpy_s(hexBuf, sizeof(hexBuf), "(not executable memory)");
+        }
+
         snprintf(buf, sizeof(buf),
-            "RTTI: vtable[%2d] = %p", i, (void*)p[i]);
+            "RTTI: vtable[%2d] = %p  prologue: %s", i, (void*)fnAddr, hexBuf);
         LogLine(buf);
     }
 }
