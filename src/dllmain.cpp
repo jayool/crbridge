@@ -1,7 +1,11 @@
+// crbridge — standalone loader for CloudRedirect
+// Iteration 8: hook BBuildAndAsyncSendFrame via MinHook and observe packets.
+
 #include <windows.h>
 #include <cstdio>
 #include "cr_loader.h"
 #include "steam_locator.h"
+#include "function_hook.h"
 
 static void LogLoad() {
     char exePath[MAX_PATH] = {};
@@ -35,6 +39,12 @@ static DWORD WINAPI InitThread(LPVOID) {
     LogLoad();
     CRLoader::TryLoad();
     SteamLocator::DiagnoseRTTI();
+
+    // Iteration 8: actually hook BBuildAndAsyncSendFrame
+    const void* sendFrame = SteamLocator::FindBBuildAndAsyncSendFrame();
+    if (sendFrame) {
+        FunctionHook::InstallBBuildAndAsyncSendFrame(const_cast<void*>(sendFrame));
+    }
     return 0;
 }
 
