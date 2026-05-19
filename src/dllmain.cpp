@@ -34,7 +34,7 @@ static void LogLoad() {
 static DWORD WINAPI InitThread(LPVOID) {
     LogLoad();
     CRLoader::TryLoad();
-    SteamLocator::Diagnose();
+    SteamLocator::DiagnoseRTTI();
     return 0;
 }
 
