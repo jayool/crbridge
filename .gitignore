@@ -427,3 +427,10 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# CMake extras
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Testing/
