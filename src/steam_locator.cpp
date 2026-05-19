@@ -1,6 +1,7 @@
 #include "steam_locator.h"
 #include <cstdio>
 #include <cstring>
+#include "vtable_hook.h"
 
 namespace {
 
@@ -252,6 +253,7 @@ bool DiagnoseRTTI() {
         const void* vtable = FindVtableForCol(sc, cols[i]);
         if (vtable) {
             DumpVtable(vtable, 16);
+            VtableHook::Install(vtable);
         }
     }
     return true;
