@@ -13,9 +13,19 @@ static void LogLoad() {
     char exePath[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, exePath, MAX_PATH);
 
+    char tempDir[MAX_PATH] = {};
+    if (GetTempPathA(MAX_PATH, tempDir) == 0) return;
+
+    char logPath[MAX_PATH] = {};
+    snprintf(logPath, MAX_PATH, "%scrbridge.log", tempDir);
+
     FILE* f = nullptr;
-    fopen_s(&f, "C:\\crbridge.log", "a");
-    if (!f) return;
+    fopen_s(&f, logPath, "a");
+    if (!f) {
+        // Si incluso TEMP falla, al menos manda al debugger
+        OutputDebugStringA("crbridge: failed to open log file\n");
+        return;
+    }
 
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -24,6 +34,12 @@ static void LogLoad() {
         st.wHour, st.wMinute, st.wSecond,
         GetCurrentProcessId(), exePath);
     fclose(f);
+    
+    // También mandamos al debugger por si quieres mirarlo con DebugView
+    char dbgMsg[1024];
+    snprintf(dbgMsg, sizeof(dbgMsg), "crbridge: loaded into PID %lu, log=%s\n",
+             GetCurrentProcessId(), logPath);
+    OutputDebugStringA(dbgMsg);
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
