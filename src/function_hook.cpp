@@ -1,4 +1,5 @@
 #include "function_hook.h"
+#include "cr_loader.h"
 #include <MinHook.h>
 #include <cstdio>
 #include <cstdint>
@@ -25,45 +26,48 @@ namespace {
         OutputDebugStringA("\n");
     }
 
-    // Signature matches LumaCore PacketRouter.cpp:
-    //   bool BBuildAndAsyncSendFrame(void* pObject, int eWebSocketOpCode,
-    //                                 uint8_t* pubData, uint32_t cubData)
+    // BBuildAndAsyncSendFrame signature (matches LumaCore PacketRouter.cpp)
     using BBAASF_t = bool (__fastcall*)(void*, int, uint8_t*, uint32_t);
     BBAASF_t g_orig = nullptr;
-    std::atomic<int> g_hitCount{0};
-    constexpr int kMaxLog = 10;
+
+    constexpr int kWebSocketOpCodeBinary = 2;
+
+    std::atomic<int> g_totalCount{0};
+    std::atomic<int> g_swallowedCount{0};
+    constexpr int kMaxLogTotal = 5;
+    constexpr int kMaxLogSwallowed = 20;
 
     bool __fastcall hkBBuildAndAsyncSendFrame(void* pObject, int opcode,
                                               uint8_t* pubData, uint32_t cubData) {
-        int count = g_hitCount.fetch_add(1) + 1;
-        if (count <= kMaxLog) {
+        int total = g_totalCount.fetch_add(1) + 1;
+
+        // Log the first few outgoing frames for diagnostics
+        if (total <= kMaxLogTotal) {
             char buf[320];
             snprintf(buf, sizeof(buf),
-                "BBAASF HIT #%d: pObject=%p opcode=%d pubData=%p size=%u",
-                count, pObject, opcode, (void*)pubData, cubData);
+                "BBAASF #%d: pObject=%p opcode=%d size=%u",
+                total, pObject, opcode, cubData);
             LogLine(buf);
+        }
 
-            // Dump first 48 bytes of pubData (the actual packet)
-            if (pubData && cubData > 0) {
-                size_t bytes = (cubData < 48) ? cubData : 48;
-                char hex[256] = {};
-                char ascii[64] = {};
-                for (size_t i = 0; i < bytes; ++i) {
-                    char tmp[8];
-                    snprintf(tmp, sizeof(tmp), "%02X ", pubData[i]);
-                    strncat_s(hex, sizeof(hex), tmp, _TRUNCATE);
-                    char c = (pubData[i] >= 32 && pubData[i] < 127)
-                        ? static_cast<char>(pubData[i]) : '.';
-                    char ctmp[2] = { c, 0 };
-                    strncat_s(ascii, sizeof(ascii), ctmp, _TRUNCATE);
+        // Only forward binary frames to CR (text/ping/pong frames don't carry RPCs)
+        if (opcode == kWebSocketOpCodeBinary && pubData && cubData > 0) {
+            auto crFn = CRLoader::GetCloudOnSendPkt();
+            if (crFn) {
+                int swallow = crFn(pObject, pubData, cubData, nullptr);
+                if (swallow) {
+                    int s = g_swallowedCount.fetch_add(1) + 1;
+                    if (s <= kMaxLogSwallowed) {
+                        char buf[200];
+                        snprintf(buf, sizeof(buf),
+                            "BBAASF #%d -> CR SWALLOWED (total swallowed: %d)", total, s);
+                        LogLine(buf);
+                    }
+                    return true;  // tell Steam the frame was "sent" successfully
                 }
-                char buf2[640];
-                snprintf(buf2, sizeof(buf2), "    pubData: %s | %s", hex, ascii);
-                LogLine(buf2);
             }
         }
 
-        // Forward to original
         return g_orig(pObject, opcode, pubData, cubData);
     }
 }
@@ -105,9 +109,10 @@ bool InstallBBuildAndAsyncSendFrame(void* target) {
         return false;
     }
 
-    char buf[160];
+    char buf[200];
     snprintf(buf, sizeof(buf),
-        "FunctionHook: BBuildAndAsyncSendFrame hooked at %p", target);
+        "FunctionHook: BBuildAndAsyncSendFrame hooked at %p, CR forwarding ENABLED",
+        target);
     LogLine(buf);
     return true;
 }
