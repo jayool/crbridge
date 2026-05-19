@@ -24,26 +24,61 @@ namespace {
         OutputDebugStringA("\n");
     }
 
-    // Generic 8-arg function pointer to forward calls without losing arguments.
-    // Covers up to 8 integer/pointer args (4 in registers + 4 on stack).
-    // Sufficient for any reasonable Steam virtual method.
+    // Dump up to `bytes` bytes (max 48) starting at `ptr`, with ASCII sidebar.
+    // Safe against unreadable memory via VirtualQuery.
+    void DumpMemSafe(const char* prefix, const void* ptr, size_t bytes) {
+        char buf[640];
+        if (!ptr) {
+            snprintf(buf, sizeof(buf), "%s (null)", prefix);
+            LogLine(buf);
+            return;
+        }
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery(ptr, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT ||
+            !(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE |
+                              PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                              PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY))) {
+            snprintf(buf, sizeof(buf), "%s (unreadable)", prefix);
+            LogLine(buf);
+            return;
+        }
+        if (bytes > 48) bytes = 48;
+        const uint8_t* p = static_cast<const uint8_t*>(ptr);
+        char hexBuf[256] = {};
+        char asciiBuf[64] = {};
+        for (size_t i = 0; i < bytes; ++i) {
+            char tmp[8];
+            snprintf(tmp, sizeof(tmp), "%02X ", p[i]);
+            strncat_s(hexBuf, sizeof(hexBuf), tmp, _TRUNCATE);
+            char c = (p[i] >= 32 && p[i] < 127) ? static_cast<char>(p[i]) : '.';
+            char ctmp[2] = { c, 0 };
+            strncat_s(asciiBuf, sizeof(asciiBuf), ctmp, _TRUNCATE);
+        }
+        snprintf(buf, sizeof(buf), "%s %s | %s", prefix, hexBuf, asciiBuf);
+        LogLine(buf);
+    }
+
     using GenericFn_t = uintptr_t (*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t,
                                        uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 
     GenericFn_t g_origs[10] = {};
     std::atomic<int> g_hitCounts[10] = {};
-    constexpr int kMaxLogPerSlot = 5;
+    constexpr int kMaxLogPerSlot = 3;  // ↓ reduced from 5 to keep log readable
 
     template <int Slot>
     uintptr_t HookFn(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
                      uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8) {
         int count = g_hitCounts[Slot].fetch_add(1) + 1;
         if (count <= kMaxLogPerSlot) {
-            char buf[320];
+            char buf[640];
             snprintf(buf, sizeof(buf),
-                "VT[%2d] HIT #%d: this=%p arg2=%p arg3=%p arg4=%p",
-                Slot, count, (void*)a1, (void*)a2, (void*)a3, (void*)a4);
+                "VT[%2d] HIT #%d: this=%p arg2=%p arg3=%p arg4=%p a5=%p a6=%p",
+                Slot, count, (void*)a1, (void*)a2, (void*)a3, (void*)a4,
+                (void*)a5, (void*)a6);
             LogLine(buf);
+            DumpMemSafe("    arg3=>", (const void*)a3, 48);
+            DumpMemSafe("    arg4=>", (const void*)a4, 48);
         }
         return g_origs[Slot](a1, a2, a3, a4, a5, a6, a7, a8);
     }
