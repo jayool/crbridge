@@ -299,24 +299,38 @@ static const void* FindBBuildAndAsyncInModule(HMODULE module, const char* module
 }
 
 const void* FindBBuildAndAsyncSendFrame() {
-    // Prefer LumaCore's diversion (where SteamUI traffic actually flows when
-    // SteaMidra is installed). Fall back to the original steamclient64.dll
-    // if no diversion exists (no SteaMidra, or different injector).
-    HMODULE diversion = GetModuleHandleA("diversion.dll");
-    if (diversion) {
-        char buf[200];
-        snprintf(buf, sizeof(buf),
-            "BBuildAndAsync: detected LumaCore diversion.dll at %p, preferring it",
-            (void*)diversion);
-        LogLine(buf);
-        const void* result = FindBBuildAndAsyncInModule(diversion, "diversion.dll");
-        if (result) return result;
-        LogLine("BBuildAndAsync: diversion present but pattern not found, falling back to steamclient64");
-    }
-
+    // Step 1: Always find the function in the original steamclient64.dll first.
+    // LumaCore doesn't touch the original, so pattern matching works there.
     HMODULE sc = WaitForSteamClient(10000);
     if (!sc) return nullptr;
-    return FindBBuildAndAsyncInModule(sc, "steamclient64.dll");
+
+    const void* originalAddr = FindBBuildAndAsyncInModule(sc, "steamclient64.dll");
+    if (!originalAddr) return nullptr;
+
+    uintptr_t rva = reinterpret_cast<uintptr_t>(originalAddr) - reinterpret_cast<uintptr_t>(sc);
+
+    char buf[400];
+
+    // Step 2: If LumaCore's diversion.dll is loaded, map the function to its
+    // address using the same RVA (diversion is a byte-exact copy of steamclient64.dll,
+    // so RVAs match, but LumaCore may have patched the diversion's function start).
+    HMODULE diversion = GetModuleHandleA("diversion.dll");
+    if (diversion) {
+        const void* diversionAddr = reinterpret_cast<const void*>(
+            reinterpret_cast<uintptr_t>(diversion) + rva);
+        snprintf(buf, sizeof(buf),
+            "BBuildAndAsync: diversion.dll detected at %p; "
+            "mapping function via RVA 0x%llX -> %p (preferring diversion for hook)",
+            (void*)diversion, (unsigned long long)rva, diversionAddr);
+        LogLine(buf);
+        return diversionAddr;
+    }
+
+    snprintf(buf, sizeof(buf),
+        "BBuildAndAsync: no diversion.dll, using original at %p (RVA 0x%llX)",
+        originalAddr, (unsigned long long)rva);
+    LogLine(buf);
+    return originalAddr;
 }
 
 bool DiagnoseRTTI() {
