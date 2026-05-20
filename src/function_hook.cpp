@@ -1,6 +1,6 @@
 #include "function_hook.h"
 #include "cr_loader.h"
-#include <MinHook.h>
+#include <detours.h>
 #include <cstdio>
 #include <cstdint>
 #include <atomic>
@@ -26,7 +26,6 @@ namespace {
         OutputDebugStringA("\n");
     }
 
-    // BBuildAndAsyncSendFrame signature (matches LumaCore PacketRouter.cpp)
     using BBAASF_t = bool (__fastcall*)(void*, int, uint8_t*, uint32_t);
     BBAASF_t g_orig = nullptr;
 
@@ -40,8 +39,6 @@ namespace {
     bool __fastcall hkBBuildAndAsyncSendFrame(void* pObject, int opcode,
                                               uint8_t* pubData, uint32_t cubData) {
         int total = g_totalCount.fetch_add(1) + 1;
-
-        // Log the first few outgoing frames for diagnostics
         if (total <= kMaxLogTotal) {
             char buf[320];
             snprintf(buf, sizeof(buf),
@@ -50,7 +47,6 @@ namespace {
             LogLine(buf);
         }
 
-        // Only forward binary frames to CR (text/ping/pong frames don't carry RPCs)
         if (opcode == kWebSocketOpCodeBinary && pubData && cubData > 0) {
             auto crFn = CRLoader::GetCloudOnSendPkt();
             if (crFn) {
@@ -63,7 +59,7 @@ namespace {
                             "BBAASF #%d -> CR SWALLOWED (total swallowed: %d)", total, s);
                         LogLine(buf);
                     }
-                    return true;  // tell Steam the frame was "sent" successfully
+                    return true;
                 }
             }
         }
@@ -80,39 +76,55 @@ bool InstallBBuildAndAsyncSendFrame(void* target) {
         return false;
     }
 
-    MH_STATUS status = MH_Initialize();
-    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
+    // Detours requires g_orig to point at the target BEFORE DetourAttach.
+    // The Attach call updates g_orig to point at the trampoline (which may
+    // chain through any existing Detours hook installed by LumaCore).
+    g_orig = reinterpret_cast<BBAASF_t>(target);
+
+    LONG err = DetourTransactionBegin();
+    if (err != NO_ERROR) {
         char buf[160];
         snprintf(buf, sizeof(buf),
-            "FunctionHook: MH_Initialize failed (status=%d)", (int)status);
+            "FunctionHook: DetourTransactionBegin failed (err=%ld)", err);
         LogLine(buf);
         return false;
     }
 
-    status = MH_CreateHook(target,
-                           reinterpret_cast<void*>(&hkBBuildAndAsyncSendFrame),
-                           reinterpret_cast<void**>(&g_orig));
-    if (status != MH_OK) {
+    err = DetourUpdateThread(GetCurrentThread());
+    if (err != NO_ERROR) {
         char buf[160];
         snprintf(buf, sizeof(buf),
-            "FunctionHook: MH_CreateHook failed (status=%d)", (int)status);
+            "FunctionHook: DetourUpdateThread failed (err=%ld)", err);
+        LogLine(buf);
+        DetourTransactionAbort();
+        return false;
+    }
+
+    err = DetourAttach(reinterpret_cast<PVOID*>(&g_orig),
+                       reinterpret_cast<PVOID>(&hkBBuildAndAsyncSendFrame));
+    if (err != NO_ERROR) {
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+            "FunctionHook: DetourAttach failed (err=%ld)", err);
+        LogLine(buf);
+        DetourTransactionAbort();
+        return false;
+    }
+
+    err = DetourTransactionCommit();
+    if (err != NO_ERROR) {
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+            "FunctionHook: DetourTransactionCommit failed (err=%ld)", err);
         LogLine(buf);
         return false;
     }
 
-    status = MH_EnableHook(target);
-    if (status != MH_OK) {
-        char buf[160];
-        snprintf(buf, sizeof(buf),
-            "FunctionHook: MH_EnableHook failed (status=%d)", (int)status);
-        LogLine(buf);
-        return false;
-    }
-
-    char buf[200];
+    char buf[240];
     snprintf(buf, sizeof(buf),
-        "FunctionHook: BBuildAndAsyncSendFrame hooked at %p, CR forwarding ENABLED",
-        target);
+        "FunctionHook: BBuildAndAsyncSendFrame hooked at %p via Detours, "
+        "trampoline at %p, CR forwarding ENABLED",
+        target, (void*)g_orig);
     LogLine(buf);
     return true;
 }
