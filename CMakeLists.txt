@@ -61,3 +61,5 @@ target_compile_definitions(crbridge PRIVATE
 )
 
 target_link_libraries(crbridge PRIVATE detours)
+
+add_subdirectory(proxy)
