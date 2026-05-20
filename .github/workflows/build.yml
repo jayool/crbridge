@@ -19,9 +19,12 @@ jobs:
       - name: Build Release
         run: cmake --build build --config Release
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v5
         with:
-          name: crbridge-dll
-          path: build/Release/crbridge.dll
-          if-no-files-found: error
+          name: crbridge
+          path: |
+            build/Release/crbridge.dll
+            build/proxy/Release/version.dll
+            scripts/install.ps1
+            scripts/uninstall.ps1
