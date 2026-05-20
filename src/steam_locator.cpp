@@ -299,8 +299,6 @@ static const void* FindBBuildAndAsyncInModule(HMODULE module, const char* module
 }
 
 const void* FindBBuildAndAsyncSendFrame() {
-    // Step 1: Always find the function in the original steamclient64.dll first.
-    // LumaCore doesn't touch the original, so pattern matching works there.
     HMODULE sc = WaitForSteamClient(10000);
     if (!sc) return nullptr;
 
@@ -311,9 +309,6 @@ const void* FindBBuildAndAsyncSendFrame() {
 
     char buf[400];
 
-    // Step 2: If LumaCore's diversion.dll is loaded, map the function to its
-    // address using the same RVA (diversion is a byte-exact copy of steamclient64.dll,
-    // so RVAs match, but LumaCore may have patched the diversion's function start).
     HMODULE diversion = GetModuleHandleA("diversion.dll");
     if (diversion) {
         const void* diversionAddr = reinterpret_cast<const void*>(
