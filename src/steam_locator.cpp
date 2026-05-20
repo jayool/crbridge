@@ -266,20 +266,15 @@ const void* FindPattern(const uint8_t* haystack, size_t haystackSize,
     return nullptr;
 }
 
-const void* FindBBuildAndAsyncSendFrame() {
-    HMODULE sc = WaitForSteamClient(10000);
-    if (!sc) return nullptr;
-
+static const void* FindBBuildAndAsyncInModule(HMODULE module, const char* moduleLabel) {
     PESection text = {};
-    if (!FindSection(sc, ".text", &text)) {
-        LogLine("BBuildAndAsync: .text section not found");
+    if (!FindSection(module, ".text", &text)) {
+        char buf[200];
+        snprintf(buf, sizeof(buf),
+            "BBuildAndAsync: .text section not found in %s", moduleLabel);
+        LogLine(buf);
         return nullptr;
     }
-
-    char buf[640];
-    snprintf(buf, sizeof(buf),
-        "BBuildAndAsync: scanning .text at %p size %zu", (void*)text.base, text.size);
-    LogLine(buf);
 
     struct Sig { const char* label; const char* pattern; };
     const Sig sigs[] = {
@@ -289,18 +284,39 @@ const void* FindBBuildAndAsyncSendFrame() {
          "48 8B C4 55 48 8D 68 A1 48 81 EC C0 00 00 00"},
     };
 
+    char buf[400];
     for (const auto& sig : sigs) {
         const void* found = FindPattern(text.base, text.size, sig.pattern);
         if (found) {
             snprintf(buf, sizeof(buf),
-                "BBuildAndAsync: FOUND at %p (sig: %s)", found, sig.label);
+                "BBuildAndAsync: FOUND in %s at %p (sig: %s)",
+                moduleLabel, found, sig.label);
             LogLine(buf);
             return found;
         }
     }
-
-    LogLine("BBuildAndAsync: NO PATTERN MATCHED — need new signature for this Steam build");
     return nullptr;
+}
+
+const void* FindBBuildAndAsyncSendFrame() {
+    // Prefer LumaCore's diversion (where SteamUI traffic actually flows when
+    // SteaMidra is installed). Fall back to the original steamclient64.dll
+    // if no diversion exists (no SteaMidra, or different injector).
+    HMODULE diversion = GetModuleHandleA("diversion.dll");
+    if (diversion) {
+        char buf[200];
+        snprintf(buf, sizeof(buf),
+            "BBuildAndAsync: detected LumaCore diversion.dll at %p, preferring it",
+            (void*)diversion);
+        LogLine(buf);
+        const void* result = FindBBuildAndAsyncInModule(diversion, "diversion.dll");
+        if (result) return result;
+        LogLine("BBuildAndAsync: diversion present but pattern not found, falling back to steamclient64");
+    }
+
+    HMODULE sc = WaitForSteamClient(10000);
+    if (!sc) return nullptr;
+    return FindBBuildAndAsyncInModule(sc, "steamclient64.dll");
 }
 
 bool DiagnoseRTTI() {
@@ -323,13 +339,10 @@ bool DiagnoseRTTI() {
         const void* vtable = FindVtableForCol(sc, cols[i]);
         if (vtable) {
             DumpVtable(vtable, 16);
-            // VtableHook::Install(vtable);  // disabled — was contaminating data
         }
     }
 
-    // Iteration 7: locate BBuildAndAsyncSendFrame
     FindBBuildAndAsyncSendFrame();
-
     return true;
 }
 
