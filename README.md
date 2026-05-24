@@ -23,12 +23,14 @@ This project does not modify CloudRedirect, SteaMidra, or LumaCore. It is a thin
 
 Saves redirect to Google Drive via CR's local HTTP server. Steam UI reports clean "cloud updated" state with no sync errors.
 
+crbridge also runs a startup compatibility check (`VersionCheck`) that reads Steam's build ID from its manifest, extracts CR's current Steam-version whitelist directly from `cloud_redirect.dll`'s `.rdata` at runtime, and logs a clear MATCH / NO MATCH verdict — so if Steam ever updates beyond what CR supports, the reason is visible in `crbridge.log` instead of being a silent failure.
+
 See [Known limitations](#known-limitations) below for the things to watch out for.
 
 ## Requirements
 
 - 64-bit Windows
-- Steam stable channel within CR's whitelist (currently `1779486452`, `1778281814`, `1778003620` — this list ships hard-coded inside `cloud_redirect.dll` and changes on each CR release)
+- Steam stable channel within CR's whitelist (currently `1779486452`, `1778281814`, `1778003620` — this list ships hard-coded inside `cloud_redirect.dll` and changes on each CR release). crbridge reads CR's whitelist live from the binary on every startup, so you do **not** need to update crbridge when CR adds support for newer Steam builds.
 - SteaMidra / LumaCore already installed and working for license unlocking — otherwise crbridge runs fine but has nothing to bridge
 - CloudRedirect's own dependencies: `cloud_redirect.dll` next to `steam.exe`, `cloud_redirect/config.json` configured, a cloud provider authenticated via CR's CLI
 
@@ -39,9 +41,19 @@ See [Known limitations](#known-limitations) below for the things to watch out fo
    - Drop `cloud_redirect.dll` next to `steam.exe`
    - Create `cloud_redirect/config.json` with at minimum `{ "cloud_redirect": true }`
    - Authenticate a cloud provider via `CloudRedirect_CliMain` (CR's CLI)
-3. Download the latest `crbridge` artifact zip from this repo's [Actions](../../actions) tab.
-4. From the zip, copy `build/Release/crbridge.dll` **and** `build/proxy/Release/version.dll` into `C:\Program Files (x86)\Steam\` (next to `steam.exe`).
-5. Restart Steam. Confirm in `%TEMP%\crbridge.log` that a line like `CRPatcher: PATCHED successfully` appears shortly after the first Cloud RPC fires (e.g., when launching a namespace-app game).
+3. Download the latest `crbridge` artifact zip from this repo's [Actions](../../actions) tab. The zip contains exactly two files at its root:
+
+   ```
+   crbridge.zip
+   ├── crbridge.dll
+   └── version.dll
+   ```
+
+4. Extract both DLLs and copy them into `C:\Program Files (x86)\Steam\` (next to `steam.exe`). Steam must be fully closed.
+5. Start Steam and open your Library. Confirm in `%TEMP%\crbridge.log` that you see, in order:
+   - `VersionCheck: status = MATCH — Steam build NNNNNNN is supported.` (quick sanity check — confirms Steam version is compatible with your CR)
+   - `FunctionHook: BBuildAndAsyncSendFrame hooked at ... CR forwarding ENABLED` (hook installed)
+   - After launching a namespace-app game: `CRPatcher: PATCHED successfully ...` (CCMInterface located, CR's INJECT path armed)
 
 No manual DLL injection is needed. `version.dll` is a side-by-side proxy that Steam loads automatically at startup, which in turn loads `crbridge.dll`.
 
@@ -62,9 +74,9 @@ The whole bridge is ~700 lines of C++ in [src/](src/). The interesting logic is 
 
 ## Known limitations
 
-- **Hard-coded memory offsets.** The bridge relies on specific addresses inside `steamclient64.dll` (accessed via LumaCore's `lcoverlay.dll`) and inside `cloud_redirect.dll`. When Selectively11 ships a new CR build or Valve updates Steam, those addresses can shift and the bridge will silently stop working. The constants live in [`src/cr_patcher.cpp`](src/cr_patcher.cpp) with comments explaining what each one is and how it was derived. A refresh-procedure document is planned.
+- **Hard-coded memory offsets.** The bridge relies on specific RVAs inside `steamclient64.dll` (accessed via LumaCore's `lcoverlay.dll`) and inside `cloud_redirect.dll`. When Selectively11 ships a CR build that restructures its data section, or Valve restructures Steam, those addresses can shift and the bridge will silently stop working. The constants live in [`src/cr_patcher.cpp`](src/cr_patcher.cpp) with comments explaining what each one is and how it was derived. A refresh-procedure document is planned. Note that this does **not** apply to CR's Steam-version whitelist — that one is extracted live from `cloud_redirect.dll` on every startup (see `src/version_check.cpp`).
 - **Load-order race with LumaCore.** crbridge polls up to 5 seconds for `lcoverlay.dll` to load before installing its hook. If LumaCore takes longer (rare), crbridge falls back to hooking the original `steamclient64.dll`, where Steam's runtime traffic doesn't actually go, and the bridge silently does nothing for that session. Restarting Steam usually resolves it.
-- **No Steam-version drift warning.** If Steam updates beyond CR's hard-coded whitelist, CR aborts internally with `FATAL: Steam version mismatch` and crbridge has no visibility — your saves will silently stop redirecting. Planned: read the manifest at startup and surface this clearly in `crbridge.log`.
+- **Steam beyond CR's whitelist still doesn't work.** crbridge now detects this case and logs `VersionCheck: status = NO MATCH` with a clear explanation, but it cannot make CR support a Steam build CR doesn't know about. When this happens, wait for a new CR release that adds the build, or roll Steam back to a supported one.
 - **Single-account assumption.** Tested with one logged-in Steam user. Behavior with Family Sharing or fast user switching is unverified.
 
 ## Building from source
