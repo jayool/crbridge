@@ -74,10 +74,48 @@ The whole bridge is ~700 lines of C++ in [src/](src/). The interesting logic is 
 
 ## Known limitations
 
-- **Hard-coded memory offsets.** The bridge relies on specific RVAs inside `steamclient64.dll` (accessed via LumaCore's `lcoverlay.dll`) and inside `cloud_redirect.dll`. When Selectively11 ships a CR build that restructures its data section, or Valve restructures Steam, those addresses can shift and the bridge will silently stop working. The constants live in [`src/cr_patcher.cpp`](src/cr_patcher.cpp) with comments explaining what each one is and how it was derived. A refresh-procedure document is planned. Note that this does **not** apply to CR's Steam-version whitelist — that one is extracted live from `cloud_redirect.dll` on every startup (see `src/version_check.cpp`).
+- **Hard-coded memory offsets.** The bridge relies on 15 specific RVAs and struct offsets inside `steamclient64.dll` (accessed via LumaCore's `lcoverlay.dll`) and inside `cloud_redirect.dll`. When Selectively11 ships a CR build that restructures its data section, or Valve restructures Steam, those addresses can shift and the bridge will silently stop working. [`tools/refresh_offsets.py`](tools/refresh_offsets.py) automates the recovery — see [Refreshing offsets](#refreshing-offsets-after-cr-or-steam-updates) below. Note that this does **not** apply to CR's Steam-version whitelist, which is extracted live on every startup (see `src/version_check.cpp`).
 - **Load-order race with LumaCore.** crbridge polls up to 5 seconds for `lcoverlay.dll` to load before installing its hook. If LumaCore takes longer (rare), crbridge falls back to hooking the original `steamclient64.dll`, where Steam's runtime traffic doesn't actually go, and the bridge silently does nothing for that session. Restarting Steam usually resolves it.
 - **Steam beyond CR's whitelist still doesn't work.** crbridge now detects this case and logs `VersionCheck: status = NO MATCH` with a clear explanation, but it cannot make CR support a Steam build CR doesn't know about. When this happens, wait for a new CR release that adds the build, or roll Steam back to a supported one.
 - **Single-account assumption.** Tested with one logged-in Steam user. Behavior with Family Sharing or fast user switching is unverified.
+
+## Refreshing offsets after CR or Steam updates
+
+CloudRedirect ships releases very frequently (≈ every 1-2 days; 27 releases over 45 days observed mid-2026), and its `.data` section moves with each one — empirically by 28 KB up to 600 KB between consecutive builds. When that happens, the 15 hard-coded constants in [`src/cr_patcher.cpp`](src/cr_patcher.cpp) become stale and crbridge stops working. Typical symptoms:
+
+- `CRPatcher: vtable mismatch ...` repeated in `crbridge.log`, never `PATCHED successfully`
+- `[INJECT] Cannot inject:` returns in `cloud_redirect.log`
+- Steam UI shows the cloud-sync error again
+
+[`tools/refresh_offsets.py`](tools/refresh_offsets.py) extracts all 15 constants directly from a fresh `cloud_redirect.dll` by anchoring on stable features (log format strings like `[INJECT] Cannot inject:` and `[CCM] Vtable mismatch at CUser+N`, the unique `lock cmpxchg byte` instruction, etc.) that survive across CR releases:
+
+```sh
+python tools/refresh_offsets.py "C:\Program Files (x86)\Steam\cloud_redirect.dll"
+```
+
+The script prints a paste-ready block of `constexpr uintptr_t` lines and compares them against the values currently in `src/cr_patcher.cpp`. If everything matches, the last line is `All extracted values MATCH what is currently in src/cr_patcher.cpp.` and there's nothing to do. If anything drifted, drifted lines are flagged inline:
+
+```
+constexpr uintptr_t CR_RVA_STEAMCLIENT_BASE  = 0x11FAB0;  // WAS 0x126C30 -- DRIFTED
+constexpr uintptr_t CR_RVA_CMINTERFACE       = 0x11FAC8;  // WAS 0x126C48 -- DRIFTED
+...
+At least one value has DRIFTED. Update src/cr_patcher.cpp before recompiling.
+```
+
+Workflow when this happens:
+
+1. Run the script against your installed `cloud_redirect.dll`.
+2. For each line marked `DRIFTED`, replace the corresponding `constexpr uintptr_t` line in `src/cr_patcher.cpp` with the new value.
+3. Commit and push — CI rebuilds and produces a fresh artifact.
+4. Deploy the new `crbridge.dll` over the old one.
+
+Whole cycle: well under a minute of attention, instead of the hour or two of manual `dumpbin /DISASM` it would take otherwise.
+
+**Tool limitations** (will be reported as `// X = NOT FOUND` in the output, never silently guessed):
+
+- Very old CR builds (pre-April 2026) may use different code patterns that the script's anchors don't match. For Category B / C entries, manual derivation may be needed in that case.
+- If Selectively11 renames or removes the log format strings the script anchors on (e.g. `[INJECT] Cannot inject:`), the corresponding extractions fail. Should be rare since those strings exist for developer diagnostics.
+- Pure stdlib — no `pip install` needed. Requires Python 3.6+.
 
 ## Building from source
 
