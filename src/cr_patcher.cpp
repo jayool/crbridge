@@ -101,6 +101,36 @@ namespace {
         return need <= end;
     }
 
+    // The pObject we receive in BBuildAndAsyncSendFrame is actually a
+    // CWebSocketConnection (verified by RTTI: ".?AVCWebSocketConnection@@"),
+    // not a CCMInterface. CCMInterface owns one or more CWebSocketConnections
+    // and they hold a back-pointer to their owner somewhere in their fields.
+    //
+    // Scan the first kScanBytes of the candidate's struct, treating each
+    // qword as a potential pointer; for each one that resolves to readable
+    // memory, check if *that* memory's first qword equals CCMInterface::vftable.
+    // The first such hit is almost certainly the owning CCMInterface — vtable
+    // identity is unique enough across a process that random qword aliasing
+    // is statistically negligible.
+    //
+    // Returns nullptr if no plausible match is found.
+    void* DeriveCmInterfaceFromCandidate(void* pCandidate, void* expectedCcmVtable) {
+        if (!IsReadable(pCandidate, sizeof(void*))) return nullptr;
+        constexpr size_t kScanBytes = 2048;
+        auto* base = static_cast<uintptr_t*>(pCandidate);
+        size_t kScanQwords = kScanBytes / sizeof(uintptr_t);
+        for (size_t i = 1; i < kScanQwords; ++i) {
+            if (!IsReadable(&base[i], sizeof(void*))) continue;
+            auto* candidate = reinterpret_cast<void*>(base[i]);
+            if (!IsReadable(candidate, sizeof(void*))) continue;
+            void* candidateVt = *static_cast<void**>(candidate);
+            if (candidateVt == expectedCcmVtable) {
+                return candidate;
+            }
+        }
+        return nullptr;
+    }
+
 } // namespace
 
 namespace CRPatcher {
@@ -119,28 +149,56 @@ bool TryPatch(void* candidateCmInterface) {
         return false;
     }
 
-    // Verify candidate's vtable BEFORE taking the lock. This is the
-    // same check CR's own `sub_180A9FD0` performs at +0x48 of the user
-    // struct; here we apply it to whatever pObject we received.
+    // The pObject from BBuildAndAsyncSendFrame is actually a
+    // CWebSocketConnection (RTTI-verified), not a CCMInterface. Verify by
+    // checking its vtable against CCMInterface::vftable; if it doesn't match
+    // (the expected case), scan its members for the owning CCMInterface
+    // back-pointer.
+    void* expectedVtable = reinterpret_cast<char*>(sc) + SC_RVA_CCMI_VTABLE;
     if (!IsReadable(candidateCmInterface, sizeof(void*))) {
         return false;
     }
+
+    void* resolvedCm = candidateCmInterface;
     void* actualVtable = *static_cast<void**>(candidateCmInterface);
-    void* expectedVtable = reinterpret_cast<char*>(sc) + SC_RVA_CCMI_VTABLE;
     if (actualVtable != expectedVtable) {
-        // Not the right kind of object — caller will retry with a later pObject.
-        // Log only first few mismatches to avoid spamming.
-        static std::atomic<int> mismatchLogCount{0};
-        int n = mismatchLogCount.fetch_add(1);
-        if (n < 3) {
-            char buf[320];
-            snprintf(buf, sizeof(buf),
-                "CRPatcher: vtable mismatch for candidate %p (expected=%p actual=%p) "
-                "— will retry on next packet (log #%d)",
-                candidateCmInterface, expectedVtable, actualVtable, n + 1);
-            LogLine(buf);
+        resolvedCm = DeriveCmInterfaceFromCandidate(candidateCmInterface, expectedVtable);
+        if (!resolvedCm) {
+            // Couldn't find a CCMInterface back-pointer in this candidate's
+            // first 2KB of fields. Try the next packet's pObject. Log only the
+            // first few attempts to avoid spam.
+            static std::atomic<int> derivationFailLogCount{0};
+            int n = derivationFailLogCount.fetch_add(1);
+            if (n < 3) {
+                char buf[400];
+                snprintf(buf, sizeof(buf),
+                    "CRPatcher: candidate %p has wrong vtable (actual=%p expected=%p) "
+                    "and no embedded CCMInterface back-pointer found in first 2048 bytes "
+                    "— will retry on next packet (log #%d)",
+                    candidateCmInterface, actualVtable, expectedVtable, n + 1);
+                LogLine(buf);
+            }
+            return false;
         }
-        return false;
+        // Compute the offset where we found the back-pointer, for diagnostics.
+        ptrdiff_t derivedOffset = -1;
+        {
+            auto* bytes = reinterpret_cast<uintptr_t*>(candidateCmInterface);
+            for (size_t i = 0; i < 256; ++i) {
+                if (reinterpret_cast<void*>(bytes[i]) == resolvedCm) {
+                    derivedOffset = static_cast<ptrdiff_t>(i * sizeof(uintptr_t));
+                    break;
+                }
+            }
+        }
+        char buf[400];
+        snprintf(buf, sizeof(buf),
+            "CRPatcher: derived CCMInterface %p from CWebSocketConnection %p "
+            "at member offset +0x%llX (vtable matches at sc+0x%llX)",
+            resolvedCm, candidateCmInterface,
+            static_cast<unsigned long long>(derivedOffset),
+            static_cast<unsigned long long>(SC_RVA_CCMI_VTABLE));
+        LogLine(buf);
     }
 
     // Acquire lock and re-check (double-checked locking).
@@ -158,7 +216,7 @@ bool TryPatch(void* candidateCmInterface) {
 
     bool ok = true;
     ok &= WriteProtectedPointer(crBase + CR_RVA_STEAMCLIENT_BASE, sc);
-    ok &= WriteProtectedPointer(crBase + CR_RVA_CMINTERFACE,      candidateCmInterface);
+    ok &= WriteProtectedPointer(crBase + CR_RVA_CMINTERFACE,      resolvedCm);
     ok &= WriteProtectedPointer(crBase + CR_RVA_WRAP_PACKET,      wrapPacket);
     ok &= WriteProtectedPointer(crBase + CR_RVA_BROUTE_MSG,       bRouteMsg);
     ok &= WriteProtectedPointer(crBase + CR_RVA_RELEASE_WRAPPED,  releaseWrap);
@@ -174,7 +232,7 @@ bool TryPatch(void* candidateCmInterface) {
         "CRPatcher: PATCHED successfully. "
         "sc=%p cr=%p cmInterface=%p (vtable matches CCMInterface::vftable @ +0x%llX) "
         "wrapPacket=%p bRouteMsgToJob=%p releaseWrapped=%p init_flag=1",
-        (void*)sc, (void*)cr, candidateCmInterface,
+        (void*)sc, (void*)cr, resolvedCm,
         (unsigned long long)SC_RVA_CCMI_VTABLE,
         wrapPacket, bRouteMsg, releaseWrap);
     LogLine(buf);
