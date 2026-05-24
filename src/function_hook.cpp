@@ -1,5 +1,6 @@
 #include "function_hook.h"
 #include "cr_loader.h"
+#include "cr_patcher.h"
 #include <detours.h>
 #include <cstdio>
 #include <cstdint>
@@ -48,6 +49,12 @@ namespace {
         }
 
         if (opcode == kWebSocketOpCodeBinary && pubData && cubData > 0) {
+            // Populate CR's INJECT globals BEFORE forwarding the first packet
+            // that CR might want to swallow. TryPatch is idempotent + cheap on
+            // the hot path once patching has succeeded; it verifies pObject's
+            // vtable internally before trusting it as the CCMInterface.
+            CRPatcher::TryPatch(pObject);
+
             auto crFn = CRLoader::GetCloudOnSendPkt();
             if (crFn) {
                 int swallow = crFn(pObject, pubData, cubData, nullptr);

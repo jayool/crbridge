@@ -52,6 +52,7 @@ add_library(crbridge SHARED
     src/steam_locator.cpp
     src/vtable_hook.cpp
     src/function_hook.cpp
+    src/cr_patcher.cpp
 )
 
 target_compile_definitions(crbridge PRIVATE
