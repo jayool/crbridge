@@ -337,11 +337,302 @@ def find_init_flag_global(data: bytes, pe: dict, debug: bool = False):
 
 
 # ---------------------------------------------------------------------------
+# Category B: SC_RVA_* — RVAs inside steamclient64.dll, encoded in CR's binary
+# as immediates inside `lea reg, [base + imm32]` and `add reg, imm32`
+# instructions. We extract them by anchoring on the CR-side globals we
+# already located (Category A), which are STORED right after the lea/add.
+# ---------------------------------------------------------------------------
+
+def find_sc_rva_lea_before_global_store(data, pe, target_cr_global_rva):
+    """For a CR-side global G at RVA `target_cr_global_rva`, locate the
+    `mov qword ptr [rip+disp32], reg` that stores into it, then read the
+    `lea reg, [base_reg + imm32]` exactly 7 bytes before. Returns imm32 or
+    None.
+
+    This is the encoding emitted by CR's setter for wrapPacket, bRouteMsg,
+    and releaseWrapped:
+        lea  rdx, [rcx + 0xD199E0]   ; 48 8D 91 disp32   (7 bytes)
+        mov  [rip+disp32_global], rdx ; 48 89 15 disp32   (7 bytes)
+    so the lea's imm32 IS the steamclient64.dll RVA we want.
+    """
+    text = section(pe, '.text')
+    base = text['raw_off']
+    sz = min(text['raw_size'], len(data) - base)
+    for i in range(7, sz - 6):
+        # Match `mov [rip+disp32], reg`:
+        rex = data[base + i]
+        if rex not in (0x48, 0x4C):
+            continue
+        if data[base + i + 1] != 0x89:
+            continue
+        modrm = data[base + i + 2]
+        # mod=00, rm=101 (RIP-relative) → modrm & 0xC7 == 0x05.
+        if (modrm & 0xC7) != 0x05:
+            continue
+        disp32 = struct.unpack_from('<i', data, base + i + 3)[0]
+        inst_rva = text['vaddr'] + i
+        if inst_rva + 7 + disp32 != target_cr_global_rva:
+            continue
+        # Found the mov-into-global. Inspect the previous 7 bytes for a lea
+        # that targets the same register.
+        prev_rex = data[base + i - 7]
+        if prev_rex != rex:
+            continue
+        if data[base + i - 6] != 0x8D:
+            continue
+        prev_modrm = data[base + i - 5]
+        # mod=10 (disp32), rm != 100 (no SIB).
+        if (prev_modrm >> 6) != 2:
+            continue
+        if (prev_modrm & 7) == 4:
+            continue
+        # Source reg of mov must equal dest reg of lea (both reg field bits 3-5
+        # with same REX.R encoded in the matching REX bytes — already enforced
+        # by `rex == prev_rex`).
+        if ((modrm >> 3) & 7) != ((prev_modrm >> 3) & 7):
+            continue
+        imm32 = struct.unpack_from('<I', data, base + i - 4)[0]
+        return imm32
+    return None
+
+
+def find_sc_rva_ccmi_vtable(data, pe, sc_base_global_rva, debug=False):
+    """Find `mov rdx, [rip+disp32_to_sc_base]; add rdx, imm32`. The imm32 is
+    SC_RVA_CCMI_VTABLE. The same pattern can use other registers — we accept
+    any reg-pair that matches itself.
+
+    Encoding:
+        48 8B XX disp32       ; mov rXX, [rip+disp32]    (7 bytes)
+        48 81 YY imm32        ; add rXX, imm32           (7 bytes)
+    where XX (modrm reg) and YY (modrm rm, since add r/m, imm has reg=000
+    sub-opcode and rm = destination register) refer to the same register.
+    """
+    text = section(pe, '.text')
+    base = text['raw_off']
+    sz = min(text['raw_size'], len(data) - base)
+    candidates = []
+    for i in range(sz - 13):
+        # mov part
+        rex1 = data[base + i]
+        if rex1 not in (0x48, 0x4C):
+            continue
+        if data[base + i + 1] != 0x8B:
+            continue
+        modrm1 = data[base + i + 2]
+        if (modrm1 & 0xC7) != 0x05:
+            continue
+        disp32_1 = struct.unpack_from('<i', data, base + i + 3)[0]
+        inst_rva = text['vaddr'] + i
+        if inst_rva + 7 + disp32_1 != sc_base_global_rva:
+            continue
+        # add part, immediately after (7 bytes later)
+        rex2 = data[base + i + 7]
+        if rex2 not in (0x48, 0x4C):
+            continue
+        if data[base + i + 8] != 0x81:
+            continue
+        modrm2 = data[base + i + 9]
+        # add r/m64, imm32 has reg-subop = 000, mod = 11 (reg-direct).
+        if (modrm2 & 0xF8) != 0xC0:
+            continue
+        # Register of the add (modrm rm with REX.B from rex2) must equal
+        # the register loaded by the mov (modrm reg with REX.R from rex1).
+        mov_reg = ((rex1 & 4) >> 2) << 3 | ((modrm1 >> 3) & 7)
+        add_reg = ((rex2 & 1)) << 3 | (modrm2 & 7)
+        if mov_reg != add_reg:
+            continue
+        imm32 = struct.unpack_from('<I', data, base + i + 10)[0]
+        candidates.append(imm32)
+    if not candidates:
+        return None, 'no `mov reg,[sc_base]; add reg, imm32` chain found'
+    # All candidates should agree on the vtable RVA. If they don't, surface
+    # that as a warning and pick the most-common one.
+    from collections import Counter
+    c = Counter(candidates)
+    if debug:
+        print(f'[dbg] CCMI_VTABLE candidates: {dict(c)}', file=sys.stderr)
+    most_common, _ = c.most_common(1)[0]
+    return most_common, None
+
+
+def find_sc_rva_engine_ptr(data, pe, sc_base_global_rva, debug=False):
+    """Find `mov reg, [rip+disp32_to_sc_base]; ...; mov reg2, [reg + imm32_big]`.
+    The imm32 is SC_RVA_ENGINE_PTR_GLOBAL. We require imm32 > 0x100000 to
+    filter out struct-field offsets, since 0x17A70E8 is a far-into-the-DLL
+    data pointer.
+
+    The intermediate `...` allows up to ~32 bytes of unrelated instructions
+    (some setup, function calls, etc.) between the load of sc_base and the
+    eventual dereference.
+    """
+    text = section(pe, '.text')
+    base = text['raw_off']
+    sz = min(text['raw_size'], len(data) - base)
+    candidates = []
+    for i in range(sz - 30):
+        rex1 = data[base + i]
+        if rex1 not in (0x48, 0x4C):
+            continue
+        if data[base + i + 1] != 0x8B:
+            continue
+        modrm1 = data[base + i + 2]
+        if (modrm1 & 0xC7) != 0x05:
+            continue
+        disp32_1 = struct.unpack_from('<i', data, base + i + 3)[0]
+        inst_rva = text['vaddr'] + i
+        if inst_rva + 7 + disp32_1 != sc_base_global_rva:
+            continue
+        loaded_reg = ((rex1 & 4) >> 2) << 3 | ((modrm1 >> 3) & 7)
+        # Scan the next ~32 bytes for `mov reg2, [reg_loaded + disp32]`.
+        for j in range(7, 64):
+            here = base + i + j
+            if here + 7 > base + sz:
+                break
+            rex2 = data[here]
+            if rex2 not in (0x48, 0x4C):
+                continue
+            if data[here + 1] != 0x8B:
+                continue
+            modrm2 = data[here + 2]
+            # mod=10 (disp32), rm != 100, rm != 101 (those have special meaning).
+            if (modrm2 >> 6) != 2:
+                continue
+            rm_bits = modrm2 & 7
+            if rm_bits == 4 or rm_bits == 5:
+                continue
+            base_reg_for_deref = ((rex2 & 1)) << 3 | rm_bits
+            if base_reg_for_deref != loaded_reg:
+                continue
+            disp32_2 = struct.unpack_from('<I', data, here + 3)[0]
+            if disp32_2 < 0x100000:
+                continue
+            candidates.append(disp32_2)
+            break  # one match per outer iteration is enough
+    if not candidates:
+        return None, 'no `mov reg,[sc_base]; ...; mov reg2,[reg + BIG_disp32]` chain found'
+    from collections import Counter
+    c = Counter(candidates)
+    if debug:
+        print(f'[dbg] ENGINE_PTR candidates: {dict(c)}', file=sys.stderr)
+    most_common, _ = c.most_common(1)[0]
+    return most_common, None
+
+
+# ---------------------------------------------------------------------------
+# Category C: ENGINE_OFF_* and USER_OFF_CCMINTERFACE — small struct-field
+# offsets used by CR when traversing Steam's user registry.
+# ---------------------------------------------------------------------------
+
+def find_engine_offsets(data, pe, engine_ptr_rva, debug=False):
+    """In the function that loads the engine pointer via
+    `mov rcx, [rax + engine_ptr_rva]`, scan the following ~60 bytes for
+    `mov reg, [rcx + disp32]` patterns. The three small disp32 values in
+    the range 0xC00..0x1000 are USER_KEY (32-bit field), USER_ARRAY (64-bit
+    pointer), USER_COUNT (32-bit field) — typically in that order.
+
+    Heuristic for mapping:
+      - The first 32-bit load        (`44 8B XX disp32`) = USER_KEY
+      - The 64-bit load              (`4C 8B XX disp32`) = USER_ARRAY
+      - The second 32-bit load       (`44 8B XX disp32`) = USER_COUNT
+    """
+    text = section(pe, '.text')
+    base = text['raw_off']
+    sz = min(text['raw_size'], len(data) - base)
+    out = {'user_key': None, 'user_array': None, 'user_count': None}
+    # Find the `mov reg, [reg + engine_ptr_rva]` site first.
+    for i in range(sz - 6):
+        rex = data[base + i]
+        if rex not in (0x48, 0x4C):
+            continue
+        if data[base + i + 1] != 0x8B:
+            continue
+        modrm = data[base + i + 2]
+        if (modrm >> 6) != 2:
+            continue
+        if (modrm & 7) == 4 or (modrm & 7) == 5:
+            continue
+        disp32 = struct.unpack_from('<I', data, base + i + 3)[0]
+        if disp32 != engine_ptr_rva:
+            continue
+        # Now scan forward for up to ~80 bytes for accesses with small disp32.
+        scan_start = base + i + 7
+        scan_end = min(scan_start + 80, base + sz)
+        loads32 = []
+        loads64 = []
+        j = scan_start
+        while j + 6 < scan_end:
+            r2 = data[j]
+            op = data[j + 1]
+            if (r2 in (0x44, 0x4C, 0x48) and op == 0x8B):
+                m2 = data[j + 2]
+                if (m2 >> 6) == 2:
+                    rm = m2 & 7
+                    if rm != 4 and rm != 5:
+                        d32 = struct.unpack_from('<I', data, j + 3)[0]
+                        if 0x800 <= d32 <= 0x1000:  # struct-field range
+                            if r2 == 0x44:        # 32-bit, high reg
+                                loads32.append(d32)
+                            elif r2 == 0x48:      # 64-bit, low reg
+                                loads64.append(d32)
+                            elif r2 == 0x4C:      # 64-bit, high reg
+                                loads64.append(d32)
+                        j += 7
+                        continue
+            j += 1
+        if debug:
+            print(f'[dbg] engine-field 32-bit loads: {[f"0x{x:X}" for x in loads32]}',
+                  file=sys.stderr)
+            print(f'[dbg] engine-field 64-bit loads: {[f"0x{x:X}" for x in loads64]}',
+                  file=sys.stderr)
+        if len(loads32) >= 2 and len(loads64) >= 1:
+            # Heuristic mapping by order of appearance.
+            out['user_key']   = loads32[0]
+            out['user_array'] = loads64[0]
+            out['user_count'] = loads32[1]
+            return out, None
+    return out, 'could not locate the engine-field access sequence'
+
+
+def find_user_off_ccminterface(data, pe, ccmi_vtable_rva, debug=False):
+    """In the function that does the vtable verification, find
+    `mov reg, [reg + disp8]` immediately before a `cmp reg, rdx` where rdx
+    holds (sc_base + SC_RVA_CCMI_VTABLE).
+
+    Easier path: anchor on the "[CCM] Vtable mismatch at CUser+72" message
+    and look at the few instructions just before its lea-xref. That message
+    is logged precisely when this `mov reg, [user + USER_OFF_CCMINTERFACE]`
+    yielded a vtable other than the expected one.
+    """
+    rdata = section(pe, '.rdata')
+    chunk = data[rdata['raw_off']:rdata['raw_off'] + rdata['raw_size']]
+    pos = chunk.find(b'[CCM] Vtable mismatch at CUser+72:')
+    if pos < 0:
+        pos = chunk.find(b'Vtable mismatch at CUser+')
+    if pos < 0:
+        return None, 'CCM vtable-mismatch string not found in .rdata'
+    str_rva = rdata['vaddr'] + pos
+    # The string itself contains the offset literal "+72" (dec) = 0x48. That
+    # is our answer in plain text. Verify by extracting the digits.
+    end = chunk.find(b'\x00', pos)
+    s = chunk[pos:end].decode('latin-1', errors='replace')
+    m = re.search(r'CUser\+(\d+)', s)
+    if m:
+        val = int(m.group(1))
+        if debug:
+            print(f'[dbg] USER_OFF_CCMINTERFACE from log string "CUser+{m.group(1)}" = 0x{val:X}',
+                  file=sys.stderr)
+        return val, None
+    return None, 'could not parse CUser+N from log string'
+
+
+# ---------------------------------------------------------------------------
 # Compare against currently-committed values, if available.
 # ---------------------------------------------------------------------------
 
 CURRENT_RVA_RE = re.compile(
-    r'constexpr\s+uintptr_t\s+(CR_RVA_\w+)\s*=\s*0x([0-9A-Fa-f]+)\s*;'
+    r'constexpr\s+uintptr_t\s+'
+    r'(CR_RVA_\w+|SC_RVA_\w+|ENGINE_OFF_\w+|USER_OFF_\w+)'
+    r'\s*=\s*0x([0-9A-Fa-f]+)\s*;'
 )
 
 def read_current_constants():
@@ -375,6 +666,7 @@ def main():
     data = Path(args.dll_path).read_bytes()
     pe = parse_pe(data)
 
+    # === Category A: CR-side data globals ============================
     inject, err = find_inject_globals(data, pe, debug=args.debug)
     if err:
         print(f'FATAL: could not extract INJECT globals: {err}', file=sys.stderr)
@@ -388,11 +680,9 @@ def main():
     if err:
         print(f'WARN:  could not extract init_flag global: {err}', file=sys.stderr)
     if isinstance(flag, list):
-        # Multiple cmpxchg sites; pick the one nearest cmInterface + 9 bytes.
         target = inject['cmInterface'] + 9
         flag = min(flag, key=lambda t: abs(t - target))
 
-    # Print paste-ready block.
     extracted = {
         'CR_RVA_STEAMCLIENT_BASE': sc_base,
         'CR_RVA_CMINTERFACE'     : inject['cmInterface'],
@@ -401,35 +691,102 @@ def main():
         'CR_RVA_BROUTE_MSG'      : inject['bRouteMsgToJob'],
         'CR_RVA_RELEASE_WRAPPED' : inject['releaseWrapped'],
     }
+
+    # === Category B: RVAs inside steamclient64.dll, encoded in CR =====
+    if extracted['CR_RVA_WRAP_PACKET']:
+        extracted['SC_RVA_WRAP_PACKET'] = find_sc_rva_lea_before_global_store(
+            data, pe, extracted['CR_RVA_WRAP_PACKET'])
+    if extracted['CR_RVA_BROUTE_MSG']:
+        extracted['SC_RVA_BROUTE_MSG'] = find_sc_rva_lea_before_global_store(
+            data, pe, extracted['CR_RVA_BROUTE_MSG'])
+    if extracted['CR_RVA_RELEASE_WRAPPED']:
+        extracted['SC_RVA_RELEASE_WRAPPED'] = find_sc_rva_lea_before_global_store(
+            data, pe, extracted['CR_RVA_RELEASE_WRAPPED'])
+
+    if sc_base:
+        vtable, err = find_sc_rva_ccmi_vtable(data, pe, sc_base, debug=args.debug)
+        if err:
+            print(f'WARN:  CCMI_VTABLE: {err}', file=sys.stderr)
+        extracted['SC_RVA_CCMI_VTABLE'] = vtable
+
+        eng, err = find_sc_rva_engine_ptr(data, pe, sc_base, debug=args.debug)
+        if err:
+            print(f'WARN:  ENGINE_PTR: {err}', file=sys.stderr)
+        extracted['SC_RVA_ENGINE_PTR_GLOBAL'] = eng
+
+        # === Category C: engine struct field offsets ==================
+        if eng:
+            engine_offs, err = find_engine_offsets(data, pe, eng, debug=args.debug)
+            if err:
+                print(f'WARN:  engine offsets: {err}', file=sys.stderr)
+            extracted['ENGINE_OFF_USER_KEY']   = engine_offs.get('user_key')
+            extracted['ENGINE_OFF_USER_ARRAY'] = engine_offs.get('user_array')
+            extracted['ENGINE_OFF_USER_COUNT'] = engine_offs.get('user_count')
+
+    # USER_OFF_CCMINTERFACE is independent of sc_base / Category B — it's
+    # parsed directly from the "[CCM] Vtable mismatch at CUser+N" log string.
+    uoff, err = find_user_off_ccminterface(
+        data, pe, extracted.get('SC_RVA_CCMI_VTABLE'), debug=args.debug)
+    if err:
+        print(f'WARN:  USER_OFF_CCMINTERFACE: {err}', file=sys.stderr)
+    extracted['USER_OFF_CCMINTERFACE'] = uoff
+
     current = read_current_constants()
 
-    print('=== Extracted CR data-section constants ===')
-    print()
-    name_pad = max(len(k) for k in extracted)
-    any_drift = False
-    for name, val in extracted.items():
-        if val is None:
-            print(f'    // {name:<{name_pad}} = NOT FOUND')
-            continue
-        line = f'    constexpr uintptr_t {name:<{name_pad}} = 0x{val:X};'
-        comment_parts = []
-        if name == 'CR_RVA_INIT_FLAG':
-            comment_parts.append('byte')
-        cur = current.get(name)
-        if cur is not None and cur != val:
-            comment_parts.append(f'WAS 0x{cur:X} -- DRIFTED')
-            any_drift = True
-        if comment_parts:
-            line += '  // ' + '; '.join(comment_parts)
-        print(line)
+    # Group + format the output.
+    groups = [
+        ('CR-side data-section globals (Category A)', [
+            'CR_RVA_STEAMCLIENT_BASE',
+            'CR_RVA_CMINTERFACE',
+            'CR_RVA_INIT_FLAG',
+            'CR_RVA_WRAP_PACKET',
+            'CR_RVA_BROUTE_MSG',
+            'CR_RVA_RELEASE_WRAPPED',
+        ]),
+        ('Steamclient64 RVAs (Category B)', [
+            'SC_RVA_WRAP_PACKET',
+            'SC_RVA_BROUTE_MSG',
+            'SC_RVA_RELEASE_WRAPPED',
+            'SC_RVA_CCMI_VTABLE',
+            'SC_RVA_ENGINE_PTR_GLOBAL',
+        ]),
+        ('Steam struct field offsets (Category C)', [
+            'ENGINE_OFF_USER_KEY',
+            'ENGINE_OFF_USER_ARRAY',
+            'ENGINE_OFF_USER_COUNT',
+            'USER_OFF_CCMINTERFACE',
+        ]),
+    ]
 
-    print()
+    any_drift = False
+    name_pad = max(len(n) for _, names in groups for n in names)
+    for title, names in groups:
+        print(f'=== {title} ===')
+        print()
+        for name in names:
+            val = extracted.get(name)
+            if val is None:
+                print(f'    // {name:<{name_pad}} = NOT FOUND')
+                continue
+            line = f'    constexpr uintptr_t {name:<{name_pad}} = 0x{val:X};'
+            comment_parts = []
+            if name == 'CR_RVA_INIT_FLAG':
+                comment_parts.append('byte')
+            cur = current.get(name)
+            if cur is not None and cur != val:
+                comment_parts.append(f'WAS 0x{cur:X} -- DRIFTED')
+                any_drift = True
+            if comment_parts:
+                line += '  // ' + '; '.join(comment_parts)
+            print(line)
+        print()
+
     if current and not any_drift:
         print('All extracted values MATCH what is currently in src/cr_patcher.cpp.')
     elif current and any_drift:
         print('At least one value has DRIFTED. Update src/cr_patcher.cpp before recompiling.')
     else:
-        print('(no current values to compare against — could not find src/cr_patcher.cpp)')
+        print('(no current values to compare against -- could not find src/cr_patcher.cpp)')
 
 
 if __name__ == '__main__':
