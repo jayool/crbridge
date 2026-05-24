@@ -116,7 +116,7 @@ namespace {
     // Returns nullptr if no plausible match is found.
     void* DeriveCmInterfaceFromCandidate(void* pCandidate, void* expectedCcmVtable) {
         if (!IsReadable(pCandidate, sizeof(void*))) return nullptr;
-        constexpr size_t kScanBytes = 2048;
+        constexpr size_t kScanBytes = 4096;
         auto* base = static_cast<uintptr_t*>(pCandidate);
         size_t kScanQwords = kScanBytes / sizeof(uintptr_t);
         for (size_t i = 1; i < kScanQwords; ++i) {
@@ -149,12 +149,34 @@ bool TryPatch(void* candidateCmInterface) {
         return false;
     }
 
+    // CRITICAL: When LumaCore is present, it copies steamclient64.dll to
+    // lcoverlay.dll (or legacy diversion.dll) and intercepts Steam's internal
+    // LoadModuleWithPath so that Steam uses the COPY at runtime. That means
+    // every running CCMInterface, CWebSocketConnection, etc. has a vtable
+    // pointer into the COPY's image, NOT the original steamclient64.dll's
+    // image. We must therefore base all our RVA arithmetic on whichever
+    // module is actually backing the runtime objects.
+    //
+    // Without this, the vtable check below would never match (we'd search
+    // for sc+0x128E7A0 but the running objects have lcoverlay+0x128E7A0),
+    // and the member-scan derivation would fail for the same reason.
+    HMODULE effective = GetModuleHandleA("lcoverlay.dll");
+    const char* effectiveName = "lcoverlay.dll";
+    if (!effective) {
+        effective = GetModuleHandleA("diversion.dll");
+        effectiveName = "diversion.dll";
+    }
+    if (!effective) {
+        effective = sc;
+        effectiveName = "steamclient64.dll (no LumaCore diversion found)";
+    }
+
     // The pObject from BBuildAndAsyncSendFrame is actually a
     // CWebSocketConnection (RTTI-verified), not a CCMInterface. Verify by
-    // checking its vtable against CCMInterface::vftable; if it doesn't match
-    // (the expected case), scan its members for the owning CCMInterface
-    // back-pointer.
-    void* expectedVtable = reinterpret_cast<char*>(sc) + SC_RVA_CCMI_VTABLE;
+    // checking its vtable against CCMInterface::vftable in the effective
+    // module; if it doesn't match (the expected case), scan its members
+    // for the owning CCMInterface back-pointer.
+    void* expectedVtable = reinterpret_cast<char*>(effective) + SC_RVA_CCMI_VTABLE;
     if (!IsReadable(candidateCmInterface, sizeof(void*))) {
         return false;
     }
@@ -165,17 +187,18 @@ bool TryPatch(void* candidateCmInterface) {
         resolvedCm = DeriveCmInterfaceFromCandidate(candidateCmInterface, expectedVtable);
         if (!resolvedCm) {
             // Couldn't find a CCMInterface back-pointer in this candidate's
-            // first 2KB of fields. Try the next packet's pObject. Log only the
+            // first 4KB of fields. Try the next packet's pObject. Log only the
             // first few attempts to avoid spam.
             static std::atomic<int> derivationFailLogCount{0};
             int n = derivationFailLogCount.fetch_add(1);
             if (n < 3) {
-                char buf[400];
+                char buf[480];
                 snprintf(buf, sizeof(buf),
-                    "CRPatcher: candidate %p has wrong vtable (actual=%p expected=%p) "
-                    "and no embedded CCMInterface back-pointer found in first 2048 bytes "
-                    "— will retry on next packet (log #%d)",
-                    candidateCmInterface, actualVtable, expectedVtable, n + 1);
+                    "CRPatcher: candidate %p has wrong vtable (actual=%p expected=%p, "
+                    "using effective base %s at %p) and no embedded CCMInterface "
+                    "back-pointer found in first 4096 bytes — will retry on next packet (log #%d)",
+                    candidateCmInterface, actualVtable, expectedVtable,
+                    effectiveName, (void*)effective, n + 1);
                 LogLine(buf);
             }
             return false;
@@ -184,19 +207,20 @@ bool TryPatch(void* candidateCmInterface) {
         ptrdiff_t derivedOffset = -1;
         {
             auto* bytes = reinterpret_cast<uintptr_t*>(candidateCmInterface);
-            for (size_t i = 0; i < 256; ++i) {
+            for (size_t i = 0; i < 512; ++i) {
                 if (reinterpret_cast<void*>(bytes[i]) == resolvedCm) {
                     derivedOffset = static_cast<ptrdiff_t>(i * sizeof(uintptr_t));
                     break;
                 }
             }
         }
-        char buf[400];
+        char buf[480];
         snprintf(buf, sizeof(buf),
             "CRPatcher: derived CCMInterface %p from CWebSocketConnection %p "
-            "at member offset +0x%llX (vtable matches at sc+0x%llX)",
+            "at member offset +0x%llX (vtable matches %s + 0x%llX)",
             resolvedCm, candidateCmInterface,
             static_cast<unsigned long long>(derivedOffset),
+            effectiveName,
             static_cast<unsigned long long>(SC_RVA_CCMI_VTABLE));
         LogLine(buf);
     }
@@ -208,14 +232,17 @@ bool TryPatch(void* candidateCmInterface) {
     }
 
     char* crBase = reinterpret_cast<char*>(cr);
-    char* scBase = reinterpret_cast<char*>(sc);
+    char* effBase = reinterpret_cast<char*>(effective);
 
-    void* wrapPacket   = scBase + SC_RVA_WRAP_PACKET;
-    void* bRouteMsg    = scBase + SC_RVA_BROUTE_MSG;
-    void* releaseWrap  = scBase + SC_RVA_RELEASE_WRAPPED;
+    void* wrapPacket   = effBase + SC_RVA_WRAP_PACKET;
+    void* bRouteMsg    = effBase + SC_RVA_BROUTE_MSG;
+    void* releaseWrap  = effBase + SC_RVA_RELEASE_WRAPPED;
 
     bool ok = true;
-    ok &= WriteProtectedPointer(crBase + CR_RVA_STEAMCLIENT_BASE, sc);
+    // CR's INJECT path reads g_steamclient64_base for several RVA computations;
+    // setting it to the effective (diverted) module keeps everything consistent
+    // within one image's address space.
+    ok &= WriteProtectedPointer(crBase + CR_RVA_STEAMCLIENT_BASE, effective);
     ok &= WriteProtectedPointer(crBase + CR_RVA_CMINTERFACE,      resolvedCm);
     ok &= WriteProtectedPointer(crBase + CR_RVA_WRAP_PACKET,      wrapPacket);
     ok &= WriteProtectedPointer(crBase + CR_RVA_BROUTE_MSG,       bRouteMsg);
@@ -230,9 +257,10 @@ bool TryPatch(void* candidateCmInterface) {
     char buf[640];
     snprintf(buf, sizeof(buf),
         "CRPatcher: PATCHED successfully. "
-        "sc=%p cr=%p cmInterface=%p (vtable matches CCMInterface::vftable @ +0x%llX) "
+        "effective_base=%s@%p (sc_orig=%p) cr=%p cmInterface=%p "
+        "(vtable matches CCMInterface::vftable @ effective+0x%llX) "
         "wrapPacket=%p bRouteMsgToJob=%p releaseWrapped=%p init_flag=1",
-        (void*)sc, (void*)cr, resolvedCm,
+        effectiveName, (void*)effective, (void*)sc, (void*)cr, resolvedCm,
         (unsigned long long)SC_RVA_CCMI_VTABLE,
         wrapPacket, bRouteMsg, releaseWrap);
     LogLine(buf);
