@@ -53,6 +53,7 @@ add_library(crbridge SHARED
     src/vtable_hook.cpp
     src/function_hook.cpp
     src/cr_patcher.cpp
+    src/version_check.cpp
 )
 
 target_compile_definitions(crbridge PRIVATE

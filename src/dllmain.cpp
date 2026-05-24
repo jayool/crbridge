@@ -6,6 +6,7 @@
 #include "cr_loader.h"
 #include "steam_locator.h"
 #include "function_hook.h"
+#include "version_check.h"
 
 static void LogLoad() {
     char exePath[MAX_PATH] = {};
@@ -38,6 +39,10 @@ static void LogLoad() {
 static DWORD WINAPI InitThread(LPVOID) {
     LogLoad();
     CRLoader::TryLoad();
+    // Report Steam-vs-CR compatibility right after CR is in memory, before
+    // any heavy hook work. This way the verdict reaches the log even if a
+    // later step fails or the user only ever looks at the first few lines.
+    VersionCheck::Run();
     SteamLocator::DiagnoseRTTI();
 
     // Iteration 8: actually hook BBuildAndAsyncSendFrame
