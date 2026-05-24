@@ -32,6 +32,16 @@ namespace {
     constexpr uintptr_t SC_RVA_RELEASE_WRAPPED = 0xEB760;
     constexpr uintptr_t SC_RVA_CCMI_VTABLE     = 0x128E7A0;  // CCMInterface::vftable
 
+    // steamclient64.dll: data layout traversal to find the current CClientUser.
+    // These offsets are read directly from CR's own sub_180AA020 disassembly —
+    // they are CR's hardcoded knowledge of Steam's engine-globals layout, and
+    // are valid for the same Steam builds CR was compiled to support.
+    constexpr uintptr_t SC_RVA_ENGINE_PTR_GLOBAL = 0x17A70E8;  // -> CSteamEngine
+    constexpr uintptr_t ENGINE_OFF_USER_KEY      = 0xC48;      // u32: current user handle
+    constexpr uintptr_t ENGINE_OFF_USER_ARRAY    = 0xCE0;      // -> [{u32 key, u32 pad, void* val}, ...]
+    constexpr uintptr_t ENGINE_OFF_USER_COUNT    = 0xCF0;      // u32: array length
+    constexpr uintptr_t USER_OFF_CCMINTERFACE    = 0x48;       // CCMInterface inlined in CClientUser
+
     // ---- Synchronization ----------------------------------------------------
 
     std::atomic<bool> g_patched{false};
@@ -113,6 +123,71 @@ namespace {
     // identity is unique enough across a process that random qword aliasing
     // is statistically negligible.
     //
+    // Replicates CR's own sub_180AA020 + sub_180A9FD0 logic to locate the
+    // CCMInterface, but using the EFFECTIVE base (lcoverlay etc.) instead of
+    // the original steamclient64.dll. This is THE reason CR's own setter fails
+    // in a LumaCore-diverted environment: CR looks up the engine global in
+    // steamclient64's data section, which is left uninitialized because Steam's
+    // runtime code lives in lcoverlay and writes its globals there instead.
+    //
+    // Returns the pointer to the CCMInterface sub-object (= CClientUser + 0x48)
+    // if traversal succeeds and the vtable check passes, otherwise nullptr.
+    // Writes a diagnostic note about which step failed via the outFailReason
+    // out-parameter (caller logs only the first failure to avoid spam).
+    void* DeriveCmInterfaceViaUserStruct(HMODULE effective, void* expectedCcmVtable,
+                                         const char** outFailReason) {
+        if (!effective) { *outFailReason = "effective base null"; return nullptr; }
+        auto* base = reinterpret_cast<uint8_t*>(effective);
+
+        auto enginePtrSlot = reinterpret_cast<void**>(base + SC_RVA_ENGINE_PTR_GLOBAL);
+        if (!IsReadable(enginePtrSlot, sizeof(void*))) {
+            *outFailReason = "engine ptr slot unreadable";
+            return nullptr;
+        }
+        void* engine = *enginePtrSlot;
+        if (!engine) { *outFailReason = "engine ptr is null"; return nullptr; }
+        if (!IsReadable(engine, 0x1000)) {
+            *outFailReason = "engine struct not readable (~4K)";
+            return nullptr;
+        }
+        auto* eng = reinterpret_cast<uint8_t*>(engine);
+
+        uint32_t key = *reinterpret_cast<uint32_t*>(eng + ENGINE_OFF_USER_KEY);
+        if (key == 0) { *outFailReason = "user key is 0 (not logged in?)"; return nullptr; }
+
+        void* array = *reinterpret_cast<void**>(eng + ENGINE_OFF_USER_ARRAY);
+        if (!array) { *outFailReason = "user array ptr is null"; return nullptr; }
+        uint32_t count = *reinterpret_cast<uint32_t*>(eng + ENGINE_OFF_USER_COUNT);
+        if (count == 0 || count > 64) {
+            *outFailReason = "user array count out of range";
+            return nullptr;
+        }
+        if (!IsReadable(array, count * 16ULL)) {
+            *outFailReason = "user array body unreadable";
+            return nullptr;
+        }
+
+        auto* entries = reinterpret_cast<uint8_t*>(array);
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t entryKey = *reinterpret_cast<uint32_t*>(entries + i * 16);
+            if (entryKey != key) continue;
+            void* user = *reinterpret_cast<void**>(entries + i * 16 + 8);
+            if (!user || !IsReadable(user, USER_OFF_CCMINTERFACE + sizeof(void*))) continue;
+            void* ccmCandidate = reinterpret_cast<uint8_t*>(user) + USER_OFF_CCMINTERFACE;
+            void* vt = *reinterpret_cast<void**>(ccmCandidate);
+            if (vt == expectedCcmVtable) {
+                return ccmCandidate;
+            }
+            // Found the user entry but its CCMInterface vtable doesn't match
+            // what we expect — record that for the diag.
+            *outFailReason = "user entry found but CCMInterface vtable mismatch at +0x48";
+        }
+        if (!*outFailReason) {
+            *outFailReason = "no user array entry matched the current user key";
+        }
+        return nullptr;
+    }
+
     // Returns nullptr if no plausible match is found.
     void* DeriveCmInterfaceFromCandidate(void* pCandidate, void* expectedCcmVtable) {
         if (!IsReadable(pCandidate, sizeof(void*))) return nullptr;
@@ -183,29 +258,47 @@ bool TryPatch(void* candidateCmInterface) {
 
     void* resolvedCm = candidateCmInterface;
     void* actualVtable = *static_cast<void**>(candidateCmInterface);
+    const char* resolveStrategy = "candidate-vtable-direct-match";
     if (actualVtable != expectedVtable) {
-        resolvedCm = DeriveCmInterfaceFromCandidate(candidateCmInterface, expectedVtable);
+        // Strategy 1: replicate CR's own user-struct traversal, but with the
+        // effective base. This is the most reliable approach because it
+        // follows Steam's actual data layout rather than guessing offsets
+        // inside an opaque struct.
+        const char* userStructFailReason = nullptr;
+        resolvedCm = DeriveCmInterfaceViaUserStruct(effective, expectedVtable, &userStructFailReason);
+        if (resolvedCm) {
+            resolveStrategy = "user-struct-traversal";
+        } else {
+            // Strategy 2: scan the candidate's own struct for an embedded
+            // CCMInterface back-pointer (CWebSocketConnection -> owner ptr).
+            resolvedCm = DeriveCmInterfaceFromCandidate(candidateCmInterface, expectedVtable);
+            if (resolvedCm) {
+                resolveStrategy = "candidate-member-scan";
+            }
+        }
         if (!resolvedCm) {
-            // Couldn't find a CCMInterface back-pointer in this candidate's
-            // first 4KB of fields. Try the next packet's pObject. Log only the
-            // first few attempts to avoid spam.
-            static std::atomic<int> derivationFailLogCount{0};
-            int n = derivationFailLogCount.fetch_add(1);
+            // Both strategies failed. Log diagnostics with as much detail as
+            // possible (first few attempts only).
+            static std::atomic<int> failLogCount{0};
+            int n = failLogCount.fetch_add(1);
             if (n < 3) {
-                char buf[480];
+                char buf[640];
                 snprintf(buf, sizeof(buf),
-                    "CRPatcher: candidate %p has wrong vtable (actual=%p expected=%p, "
-                    "using effective base %s at %p) and no embedded CCMInterface "
-                    "back-pointer found in first 4096 bytes — will retry on next packet (log #%d)",
+                    "CRPatcher: ALL strategies failed for candidate %p "
+                    "(actual_vtable=%p expected=%p effective=%s@%p). "
+                    "user-struct: %s. member-scan: no back-pointer in first 4096B. "
+                    "will retry on next packet (log #%d)",
                     candidateCmInterface, actualVtable, expectedVtable,
-                    effectiveName, (void*)effective, n + 1);
+                    effectiveName, (void*)effective,
+                    userStructFailReason ? userStructFailReason : "(no reason set)",
+                    n + 1);
                 LogLine(buf);
             }
             return false;
         }
-        // Compute the offset where we found the back-pointer, for diagnostics.
+        // Log success with strategy + offset (if member-scan was used).
         ptrdiff_t derivedOffset = -1;
-        {
+        if (strcmp(resolveStrategy, "candidate-member-scan") == 0) {
             auto* bytes = reinterpret_cast<uintptr_t*>(candidateCmInterface);
             for (size_t i = 0; i < 512; ++i) {
                 if (reinterpret_cast<void*>(bytes[i]) == resolvedCm) {
@@ -214,14 +307,22 @@ bool TryPatch(void* candidateCmInterface) {
                 }
             }
         }
-        char buf[480];
-        snprintf(buf, sizeof(buf),
-            "CRPatcher: derived CCMInterface %p from CWebSocketConnection %p "
-            "at member offset +0x%llX (vtable matches %s + 0x%llX)",
-            resolvedCm, candidateCmInterface,
-            static_cast<unsigned long long>(derivedOffset),
-            effectiveName,
-            static_cast<unsigned long long>(SC_RVA_CCMI_VTABLE));
+        char buf[560];
+        if (derivedOffset >= 0) {
+            snprintf(buf, sizeof(buf),
+                "CRPatcher: derived CCMInterface %p via %s from %p "
+                "(member offset +0x%llX, vtable matches %s + 0x%llX)",
+                resolvedCm, resolveStrategy, candidateCmInterface,
+                static_cast<unsigned long long>(derivedOffset),
+                effectiveName,
+                static_cast<unsigned long long>(SC_RVA_CCMI_VTABLE));
+        } else {
+            snprintf(buf, sizeof(buf),
+                "CRPatcher: derived CCMInterface %p via %s "
+                "(vtable matches %s + 0x%llX)",
+                resolvedCm, resolveStrategy, effectiveName,
+                static_cast<unsigned long long>(SC_RVA_CCMI_VTABLE));
+        }
         LogLine(buf);
     }
 
