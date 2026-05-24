@@ -309,21 +309,43 @@ const void* FindBBuildAndAsyncSendFrame() {
 
     char buf[400];
 
-    HMODULE diversion = GetModuleHandleA("diversion.dll");
+    // Poll for LumaCore's diversion module. Modern SteaMidra (post-2026-05)
+    // uses bin/lcoverlay.dll; older versions used bin/diversion.dll. Both
+    // are copies of steamclient64.dll where LumaCore installs its own hooks,
+    // and Steam routes its CM packets through that copy — so we MUST hook it,
+    // not the original, or our intercept never fires.
+    //
+    // We poll because LumaCore loads via a sibling dwmapi.dll proxy and often
+    // loses the race against our version.dll proxy. Without this wait we'd
+    // race-condition into hooking the unused original module.
+    const char* candidates[] = { "lcoverlay.dll", "diversion.dll" };
+    HMODULE diversion = nullptr;
+    const char* foundName = nullptr;
+    constexpr int kMaxWaitMs = 5000;
+    constexpr int kStepMs = 100;
+    for (int waited = 0; waited <= kMaxWaitMs && !diversion; waited += kStepMs) {
+        for (const char* name : candidates) {
+            diversion = GetModuleHandleA(name);
+            if (diversion) { foundName = name; break; }
+        }
+        if (!diversion) Sleep(kStepMs);
+    }
+
     if (diversion) {
         const void* diversionAddr = reinterpret_cast<const void*>(
             reinterpret_cast<uintptr_t>(diversion) + rva);
         snprintf(buf, sizeof(buf),
-            "BBuildAndAsync: diversion.dll detected at %p; "
+            "BBuildAndAsync: %s detected at %p; "
             "mapping function via RVA 0x%llX -> %p (preferring diversion for hook)",
-            (void*)diversion, (unsigned long long)rva, diversionAddr);
+            foundName, (void*)diversion, (unsigned long long)rva, diversionAddr);
         LogLine(buf);
         return diversionAddr;
     }
 
     snprintf(buf, sizeof(buf),
-        "BBuildAndAsync: no diversion.dll, using original at %p (RVA 0x%llX)",
-        originalAddr, (unsigned long long)rva);
+        "BBuildAndAsync: no diversion module (lcoverlay.dll/diversion.dll) "
+        "after %dms; using original at %p (RVA 0x%llX)",
+        kMaxWaitMs, originalAddr, (unsigned long long)rva);
     LogLine(buf);
     return originalAddr;
 }
