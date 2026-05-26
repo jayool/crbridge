@@ -4,7 +4,6 @@
 
 namespace {
     HMODULE g_crModule = nullptr;
-    CRLoader::CloudOnSendPkt_t g_pCloudOnSendPkt = nullptr;
 
     void LogLine(const char* msg) {
         char tempDir[MAX_PATH] = {};
@@ -39,9 +38,7 @@ namespace CRLoader {
 bool TryLoad() {
     if (g_crModule) return true;
 
-    std::string hostDir = GetHostDir();
-    std::string crPath = hostDir + "\\cloud_redirect.dll";
-
+    std::string crPath = GetHostDir() + "\\cloud_redirect.dll";
     g_crModule = LoadLibraryA(crPath.c_str());
     if (!g_crModule) {
         char buf[640];
@@ -49,7 +46,6 @@ bool TryLoad() {
             "CRLoader: LoadLibrary failed for '%s' (error %lu)",
             crPath.c_str(), GetLastError());
         LogLine(buf);
-        // Fallback: try system search path
         g_crModule = LoadLibraryA("cloud_redirect.dll");
         if (!g_crModule) {
             snprintf(buf, sizeof(buf),
@@ -60,28 +56,11 @@ bool TryLoad() {
         }
     }
 
-    char buf[640];
+    char buf[160];
     snprintf(buf, sizeof(buf),
         "CRLoader: cloud_redirect.dll loaded at %p", (void*)g_crModule);
     LogLine(buf);
-
-    g_pCloudOnSendPkt = (CloudOnSendPkt_t)GetProcAddress(g_crModule, "CloudOnSendPkt");
-    if (!g_pCloudOnSendPkt) {
-        snprintf(buf, sizeof(buf),
-            "CRLoader: GetProcAddress(CloudOnSendPkt) failed (error %lu)",
-            GetLastError());
-        LogLine(buf);
-        return false;
-    }
-
-    snprintf(buf, sizeof(buf),
-        "CRLoader: CloudOnSendPkt resolved at %p", (void*)g_pCloudOnSendPkt);
-    LogLine(buf);
     return true;
-}
-
-CloudOnSendPkt_t GetCloudOnSendPkt() {
-    return g_pCloudOnSendPkt;
 }
 
 } // namespace CRLoader

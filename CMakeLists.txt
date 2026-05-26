@@ -13,9 +13,8 @@ if(NOT WIN32)
     message(FATAL_ERROR "crbridge targets Windows only")
 endif()
 
-# Microsoft Detours — same library LumaCore uses so they chain properly when
-# both projects hook the same Steam function. Detours has no top-level CMakeLists,
-# so we fetch sources and build a static lib ourselves.
+# Microsoft Detours — same library LumaCore uses, so hooks chain correctly.
+# Detours has no top-level CMakeLists, so we fetch sources and build it.
 include(FetchContent)
 FetchContent_Declare(
     detours
@@ -49,10 +48,7 @@ endif()
 add_library(crbridge SHARED
     src/dllmain.cpp
     src/cr_loader.cpp
-    src/steam_locator.cpp
-    src/vtable_hook.cpp
-    src/function_hook.cpp
-    src/cr_patcher.cpp
+    src/host_alias.cpp
     src/version_check.cpp
 )
 
