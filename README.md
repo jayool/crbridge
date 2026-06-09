@@ -2,7 +2,7 @@
 
 A 64-bit Windows DLL that bootstraps [CloudRedirect](https://github.com/Selectively11/CloudRedirect) inside Steam's process **without requiring SteamTools**, so you can use CR's cloud-save redirection alongside [SteaMidra (LumaCore)](https://github.com/Midrags/SFF). Designed to **coexist with LumaCore without modifying or forking either project**.
 
-Upstream CR is designed to be loaded by SteamTools — which has documented backdoor behavior (downloads and executes arbitrary DLLs from remote servers, harvests Steam credentials; see [SteamTools-Deep-Analyze](https://github.com/Hegxib/SteamTools-Deep-Analyze) for the writeup). crbridge is the SteamTools-free alternative.
+Upstream CR is designed to be loaded by SteamTools. Some users prefer not to rely on SteamTools (see [SteamTools-Deep-Analyze](https://github.com/Hegxib/SteamTools-Deep-Analyze) for one such analysis); crbridge is the alternative for them.
 
 > ⚠️ **Educational / research use only.** Use it with your own Steam account
 > and content. Do not redistribute Valve binaries. The author does not host or
@@ -33,13 +33,7 @@ Tested with Steam stable on 64-bit Windows. Steam **must be closed** when you co
 
 1. **LumaCore (via SteaMidra)**. Install [SteaMidra](https://github.com/Midrags/SFF) following its own instructions. Confirm it works standalone (a namespace app appears as owned in your Library).
 
-2. **CloudRedirect** (v2.1.6 or newer). Drop `cloud_redirect.dll` next to `steam.exe`. Create `cloud_redirect/config.json` with at minimum:
-
-   ```json
-   { "cloud_redirect": true }
-   ```
-
-   Authenticate a cloud provider via CR's app (or `CloudRedirect_CliMain` if you prefer the CLI).
+2. **CloudRedirect** (v2.1.6 or newer). Drop `cloud_redirect.dll` next to `steam.exe` and authenticate a cloud provider via CR's app. The app writes its own `config.json` when you sign in — no manual editing required.
 
 3. **crbridge**. Download the latest `crbridge` artifact zip from this repo's [Actions](../../actions) tab:
 
@@ -51,22 +45,11 @@ Tested with Steam stable on 64-bit Windows. Steam **must be closed** when you co
 
    Copy both DLLs into `C:\Program Files (x86)\Steam\` (next to `steam.exe`).
 
-4. Start Steam and log in. Open `%TEMP%\crbridge.log` and look for the success markers:
-
-   ```
-   SteamLocator: steamclient64.dll loaded at …
-   SteamLocator: diversion module lcoverlay.dll loaded at …
-   CRLoader: cloud_redirect.dll loaded at …
-   CRLoader: resolved API: CR_InitCloudSave=… CR_SetApps=… CR_Shutdown=…
-   CRIatHook: GetModuleHandleA hooked at IAT slot …
-   crbridge: CR_InitCloudSave succeeded — CR is now active.
-   ```
-
-5. Saves for namespace apps redirect to the cloud provider you configured. Steam's UI shows clean "cloud updated" state.
+4. Start Steam and log in. Saves for your games redirect to the cloud provider you configured. Steam's UI shows clean "cloud updated" state.
 
 ### After a CloudRedirect update
 
-CR ships releases frequently (≈ every 1-2 days). Most updates are transparent to crbridge because we no longer depend on CR's internal data layout — the IAT hook only relies on CR continuing to use `GetModuleHandleA` to look up Steam, which is the standard Windows pattern.
+Most updates are transparent to crbridge — the IAT hook only relies on CR continuing to use `GetModuleHandleA` to look up Steam, which is the standard Windows pattern.
 
 The exception: if a CR release moves the import binding to a different DLL (e.g. an apiset crbridge doesn't yet cover), the hook installer will log `IAT entry for GetModuleHandleA not found` and abort. In that case, file an issue with the offending CR version so we can extend the lookup chain.
 
@@ -80,6 +63,21 @@ The exception: if a CR release moves the import binding to a different DLL (e.g.
 ## Troubleshooting
 
 Log: `%TEMP%\crbridge.log` (open with `notepad %TEMP%\crbridge.log`).
+
+### Verifying it's working
+
+On a healthy startup the log contains, in order:
+
+```
+SteamLocator: steamclient64.dll loaded at …
+SteamLocator: diversion module lcoverlay.dll loaded at …
+CRLoader: cloud_redirect.dll loaded at …
+CRLoader: resolved API: CR_InitCloudSave=… CR_SetApps=… CR_Shutdown=…
+CRIatHook: GetModuleHandleA hooked at IAT slot …
+crbridge: CR_InitCloudSave succeeded — CR is now active.
+```
+
+If any of these is missing, find the matching failure mode below.
 
 ### `CR_InitCloudSave export not found — is this cloud_redirect.dll v2.1.6 or newer?`
 
@@ -136,14 +134,6 @@ CR doesn't know it was redirected. From CR's perspective, `steamclient64.dll` si
 5. Calls `CR_InitCloudSave(steamPath, nullptr)`. CR self-installs the rest.
 
 On `DLL_PROCESS_DETACH` we call `CR_Shutdown` (best-effort) so CR can drain pending HTTP work and close sockets cleanly.
-
-### Why this is simpler than iteration 9
-
-Iteration 9 (the original approach, pre–CR 2.1.6) hosted CR by acting as SteamTools' replacement: it RE'd Steam to find `CCMInterface` and three helper functions, then wrote those pointers into specific offsets inside CR's `.data` section, then set CR's init flag. That worked but tied crbridge's source to 15 hard-coded RVAs / struct offsets inside both `cloud_redirect.dll` and `steamclient64.dll`. Every CR release required running `tools/refresh_offsets.py` and reapplying.
-
-Iteration 10 (the IAT-hook approach) drops that fragility entirely. CR's data layout no longer matters to crbridge — only that CR keeps using `GetModuleHandleA` for its Steam-module lookup, which is the standard Windows pattern Selectively11 is highly unlikely to change.
-
-Net diff iteration 9 → iteration 10: ~1500 lines of code removed, Microsoft Detours dependency removed, `tools/refresh_offsets.py` removed.
 
 ## Build infrastructure
 
