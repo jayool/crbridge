@@ -13,46 +13,15 @@ if(NOT WIN32)
     message(FATAL_ERROR "crbridge targets Windows only")
 endif()
 
-# Microsoft Detours — same library LumaCore uses so they chain properly when
-# both projects hook the same Steam function. Detours has no top-level CMakeLists,
-# so we fetch sources and build a static lib ourselves.
-include(FetchContent)
-FetchContent_Declare(
-    detours
-    GIT_REPOSITORY https://github.com/microsoft/Detours.git
-    GIT_TAG        main
-    GIT_SHALLOW    TRUE
-    SOURCE_SUBDIR  cmake-noop
-)
-FetchContent_MakeAvailable(detours)
-
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    set(DETOURS_ARCH_SRC "${detours_SOURCE_DIR}/src/disolx64.cpp")
-else()
-    set(DETOURS_ARCH_SRC "${detours_SOURCE_DIR}/src/disolx86.cpp")
-endif()
-
-add_library(detours STATIC
-    ${detours_SOURCE_DIR}/src/detours.cpp
-    ${detours_SOURCE_DIR}/src/modules.cpp
-    ${detours_SOURCE_DIR}/src/disasm.cpp
-    ${detours_SOURCE_DIR}/src/image.cpp
-    ${detours_SOURCE_DIR}/src/creatwth.cpp
-    ${DETOURS_ARCH_SRC}
-)
-target_include_directories(detours PUBLIC "${detours_SOURCE_DIR}/src")
-set_target_properties(detours PROPERTIES POSITION_INDEPENDENT_CODE ON)
-if(MSVC)
-    target_compile_options(detours PRIVATE /w)
-endif()
+# Iteration 10 dropped the BBuildAndAsyncSendFrame Detours hook in favour
+# of an IAT hook on GetModuleHandleA, so the Detours dependency is gone.
+# IAT hooking is a direct write to the import table, no library required.
 
 add_library(crbridge SHARED
     src/dllmain.cpp
     src/cr_loader.cpp
+    src/cr_iat_hook.cpp
     src/steam_locator.cpp
-    src/vtable_hook.cpp
-    src/function_hook.cpp
-    src/cr_patcher.cpp
     src/version_check.cpp
 )
 
@@ -61,7 +30,5 @@ target_compile_definitions(crbridge PRIVATE
     NOMINMAX
     _CRT_SECURE_NO_WARNINGS
 )
-
-target_link_libraries(crbridge PRIVATE detours)
 
 add_subdirectory(proxy)

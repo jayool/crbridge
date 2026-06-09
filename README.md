@@ -4,118 +4,97 @@ Standalone loader for [CloudRedirect](https://github.com/Selectively11/CloudRedi
 
 ## What this is
 
-CloudRedirect enables Steam Cloud functionality for games that don't natively support it, by intercepting Steam's cloud-save RPC calls and redirecting them to Google Drive, OneDrive, or a local folder.
+CloudRedirect (CR) enables Steam Cloud functionality for games that don't natively support it, by intercepting Steam's cloud-save RPC calls and redirecting them to Google Drive, OneDrive, or a local folder.
 
-Upstream CloudRedirect is designed to be loaded by SteamTools, which has documented backdoor behavior (downloads and executes arbitrary DLLs from remote servers, harvests Steam credentials — see [SteamTools-Deep-Analyze](https://github.com/Hegxib/SteamTools-Deep-Analyze) for the technical writeup).
+Upstream CR is designed to be loaded by SteamTools, which has documented backdoor behavior (downloads and executes arbitrary DLLs from remote servers, harvests Steam credentials — see [SteamTools-Deep-Analyze](https://github.com/Hegxib/SteamTools-Deep-Analyze) for the technical writeup).
 
-**crbridge replaces SteamTools** as CloudRedirect's host. It is designed to coexist with [SteaMidra (LumaCore)](https://github.com/Midrags/SFF), the open-source GPLv3 alternative people use for license unlocking. Together they let you have CR's cloud-save redirection without ever installing SteamTools.
+**crbridge replaces SteamTools** as CR's host. It is designed to coexist with [SteaMidra (LumaCore)](https://github.com/Midrags/SFF), the open-source GPLv3 alternative people use for license unlocking. Together they let you have CR's cloud-save redirection without ever installing SteamTools.
 
-This project does not modify CloudRedirect, SteaMidra, or LumaCore. It is a thin bridge that lets an unmodified CloudRedirect run in a SteamTools-free environment.
+This project does not modify CR, SteaMidra, or LumaCore. It is a thin bridge that lets an unmodified CR run in a SteamTools-free environment.
 
 ## Status
 
-**Iteration 9 — end-to-end working** as of 2026-05-24. Verified with:
+**Iteration 10 (refactor/iat-hook)** — written against CR v2.1.6+'s public API. Not yet tested end-to-end against current CR on a LumaCore-enabled Steam install. Once verified, this replaces the iteration 9 approach (data-section pokes) which is broken with CR ≥ 2.1.6 because the relevant data globals are now self-initialized internally and the `CloudOnSendPkt` export is gone.
 
-- Steam stable build `1779486452`
-- CloudRedirect (md5 `0ee5a330…`, supports Steam builds `1779486452 / 1778281814 / 1778003620`)
-- SteaMidra current release (LumaCore using `bin/lcoverlay.dll` as its diverted module)
-- Test game: Balatro (`app=2379780`) added as a namespace app via SteaMidra Lua
-
-Saves redirect to Google Drive via CR's local HTTP server. Steam UI reports clean "cloud updated" state with no sync errors.
-
-crbridge also runs a startup compatibility check (`VersionCheck`) that reads Steam's build ID from its manifest, extracts CR's current Steam-version whitelist directly from `cloud_redirect.dll`'s `.rdata` at runtime, and logs a clear MATCH / NO MATCH verdict — so if Steam ever updates beyond what CR supports, the reason is visible in `crbridge.log` instead of being a silent failure.
-
-See [Known limitations](#known-limitations) below for the things to watch out for.
+The iteration 9 README and code live in `main` branch; this README/code lives in `refactor/iat-hook`. Merge happens after the user reports green logs from a real Steam + LumaCore setup.
 
 ## Requirements
 
 - 64-bit Windows
-- Steam stable channel within CR's whitelist (currently `1779486452`, `1778281814`, `1778003620` — this list ships hard-coded inside `cloud_redirect.dll` and changes on each CR release). crbridge reads CR's whitelist live from the binary on every startup, so you do **not** need to update crbridge when CR adds support for newer Steam builds.
-- SteaMidra / LumaCore already installed and working for license unlocking — otherwise crbridge runs fine but has nothing to bridge
-- CloudRedirect's own dependencies: `cloud_redirect.dll` next to `steam.exe`, `cloud_redirect/config.json` configured, a cloud provider authenticated via CR's CLI
+- CloudRedirect **v2.1.6 or newer** (`CR_InitCloudSave`, `CR_SetApps`, `CR_Shutdown` exports must exist). The bridge logs a diagnostic and refuses to continue if it loads an older `cloud_redirect.dll`.
+- SteaMidra / LumaCore installed and working for license unlocking. crbridge runs fine without it (the IAT hook simply falls through to vanilla steamclient64) but in that case CR's cloud redirect doesn't have anything LumaCore-specific to bridge.
+- CR's own dependencies: `cloud_redirect.dll` next to `steam.exe`, `cloud_redirect/config.json` configured, a cloud provider authenticated via the CR Flatpak app or `CloudRedirect_CliMain`.
 
 ## Installation
 
 1. Install [SteaMidra](https://github.com/Midrags/SFF) following its own instructions. Confirm it works standalone (a namespace app appears as owned in your Library).
-2. Install [CloudRedirect](https://github.com/Selectively11/CloudRedirect):
-   - Drop `cloud_redirect.dll` next to `steam.exe`
-   - Create `cloud_redirect/config.json` with at minimum `{ "cloud_redirect": true }`
-   - Authenticate a cloud provider via `CloudRedirect_CliMain` (CR's CLI)
-3. Download the latest `crbridge` artifact zip from this repo's [Actions](../../actions) tab. The zip contains exactly two files at its root:
-
+2. Install CloudRedirect:
+   - Drop `cloud_redirect.dll` (v2.1.6+) next to `steam.exe`.
+   - Create `cloud_redirect/config.json` with at minimum `{ "cloud_redirect": true }`.
+   - Authenticate a cloud provider via the CR app.
+3. Download the latest `crbridge` artifact zip from this repo's [Actions](../../actions) tab. The zip contains:
    ```
    crbridge.zip
    ├── crbridge.dll
    └── version.dll
    ```
-
 4. Extract both DLLs and copy them into `C:\Program Files (x86)\Steam\` (next to `steam.exe`). Steam must be fully closed.
-5. Start Steam and open your Library. Confirm in `%TEMP%\crbridge.log` that you see, in order:
-   - `VersionCheck: status = MATCH — Steam build NNNNNNN is supported.` (quick sanity check — confirms Steam version is compatible with your CR)
-   - `FunctionHook: BBuildAndAsyncSendFrame hooked at ... CR forwarding ENABLED` (hook installed)
-   - After launching a namespace-app game: `CRPatcher: PATCHED successfully ...` (CCMInterface located, CR's INJECT path armed)
+5. Start Steam and log in. Confirm in `%TEMP%\crbridge.log` that you see, in order:
+   - `SteamLocator: steamclient64.dll loaded at …`
+   - `SteamLocator: diversion module lcoverlay.dll loaded at …` (if you're using LumaCore)
+   - `CRLoader: cloud_redirect.dll loaded at …`
+   - `CRLoader: resolved API: CR_InitCloudSave=… CR_SetApps=… CR_Shutdown=…`
+   - `CRIatHook: GetModuleHandleA hooked at IAT slot …`
+   - `crbridge: CR_InitCloudSave succeeded — CR is now active.`
 
-No manual DLL injection is needed. `version.dll` is a side-by-side proxy that Steam loads automatically at startup, which in turn loads `crbridge.dll`.
+`version.dll` is a side-by-side proxy that Steam loads automatically at startup, which in turn loads `crbridge.dll`. No manual DLL injection.
 
-## How it works
+## How it works (iteration 10)
 
-CloudRedirect intercepts outgoing `Cloud.*` RPC packets, performs the redirect, and injects synthetic responses back into Steam so the client believes Valve approved the operation. Both halves require knowing where several Steam-internal functions and objects live in memory — under SteamTools, that knowledge is provided by SteamTools' `Payload.dll`.
+CR v2.1.6 introduced a public C API: `CR_InitCloudSave(steamPath, notify)` self-initializes everything — finds CCMInterface inside Steam's runtime module, installs its own vtable hooks on the cloud RPC dispatcher, etc. The host's job collapses to one call.
 
-crbridge does the same job differently:
+There's a snag in the LumaCore case: CR's lookup hardcodes `GetModuleHandleA("steamclient64.dll")`. In a LumaCore-diverted Steam, the runtime code executes from `lcoverlay.dll` (a renamed copy of `steamclient64.dll` where LumaCore installs its own intercepts). The dormant vanilla `steamclient64.dll` is still loaded — `GetModuleHandleA` happily returns its handle — but no live runtime objects exist there. CR walks that empty module, finds no CCMInterface, and `CR_InitCloudSave` returns false.
 
-1. A `version.dll` proxy in the Steam directory is loaded automatically by Steam at startup. It calls `LoadLibrary` on `crbridge.dll`.
-2. `crbridge.dll` waits for LumaCore's `lcoverlay.dll` (or legacy `diversion.dll`) — the patched copy of `steamclient64.dll` where Steam's runtime actually executes — to be loaded.
-3. It locates `BBuildAndAsyncSendFrame` inside that module via byte-pattern matching, and installs a Microsoft Detours hook (the same library LumaCore uses, so trampolines chain correctly).
-4. On the first binary WebSocket frame, it walks Steam's internal user-handle registry to locate the running `CCMInterface` instance.
-5. It writes that `CCMInterface` pointer plus three Steam helper functions (`wrapPacket`, `bRouteMsgToJob`, `releaseWrapped`) directly into CloudRedirect's `.data` section, then sets CR's init flag so CR skips its own (broken-in-this-environment) initialization.
-6. Subsequent Cloud RPC packets are forwarded to `cloud_redirect.dll!CloudOnSendPkt`, which can now intercept and inject responses normally.
+crbridge fixes this with a small **IAT hook**: it overwrites cloud_redirect.dll's Import Address Table entry for `GetModuleHandleA` to point at a thunk we control. The thunk:
 
-The whole bridge is ~700 lines of C++ in [src/](src/). The interesting logic is in [`src/cr_patcher.cpp`](src/cr_patcher.cpp).
+- If the requested module is `"steamclient64.dll"` → returns the handle of `lcoverlay.dll` (falling back to legacy `diversion.dll`).
+- Anything else → chains to the real `GetModuleHandleA`.
+
+CR doesn't know it was redirected. From CR's perspective `steamclient64.dll` simply *is* at lcoverlay's base. CR's internal RVA arithmetic, RTTI scans, and CCMInterface traversal all walk lcoverlay (where the live objects are) and `CR_InitCloudSave` succeeds.
+
+Sequence inside `crbridge.dll`:
+
+1. `version.dll` proxy in the Steam directory loads at process startup. It calls `LoadLibrary` on `crbridge.dll`.
+2. `crbridge.dll`'s `InitThread` waits for `steamclient64.dll` to load (up to 10 s) and best-effort waits for the LumaCore diversion module.
+3. Loads `cloud_redirect.dll` and resolves `CR_InitCloudSave`, `CR_SetApps`, `CR_Shutdown`. Aborts with a diagnostic if CR is older than 2.1.6 (no `CR_InitCloudSave` export).
+4. Logs a `VersionCheck` line comparing the running Steam build against CR's whitelist (purely diagnostic, doesn't gate anything).
+5. Installs the IAT hook on `cloud_redirect.dll`'s `GetModuleHandleA` import (kernel32 or apiset variants).
+6. Calls `CR_InitCloudSave(steamPath, nullptr)`. CR does the rest.
+
+On `DLL_PROCESS_DETACH` we call `CR_Shutdown` (best-effort) so CR can drain pending HTTP work and close sockets cleanly.
+
+Everything fits in ~350 lines of C++ in [`src/`](src/). The interesting parts are [`src/cr_iat_hook.cpp`](src/cr_iat_hook.cpp) (the redirect) and [`src/dllmain.cpp`](src/dllmain.cpp) (the orchestration).
+
+## Why this replaces the old approach
+
+Iteration 9 worked against CR ≤ 2.1.5 by writing six pointers directly into CR's `.data` section: CCMInterface, three Steam helper functions (`wrapPacket`, `bRouteMsgToJob`, `releaseWrapped`), the effective module base, and a "ready" flag. CR was passive — it consumed those pointers and called the helpers we provided.
+
+Two things make that approach impossible against current CR:
+
+1. The data slots still exist but CR's internal init now writes them itself. Any value the host writes is overwritten when `CR_InitCloudSave` runs.
+2. The `CloudOnSendPkt` export — the entry point the iteration 9 hook handler forwarded packets to — was removed. There's no public function to call.
+
+Iteration 10 stops pretending to be SteamTools and instead patches the one assumption CR makes that doesn't hold in LumaCore mode (the module to walk). Everything else — RPC interception, response injection, app-list management — is CR's job now, not ours.
+
+A nice side-effect: the iteration 9 fragility around CR's data-section layout is gone. There is no `refresh_offsets.py` anymore because there are no offsets to refresh. The bridge is opaque to CR's release cadence as long as CR keeps using `GetModuleHandleA` for its module lookup (which it has done across at least v2.1.6 and v2.1.7).
 
 ## Known limitations
 
-- **Hard-coded memory offsets.** The bridge relies on 15 specific RVAs and struct offsets inside `steamclient64.dll` (accessed via LumaCore's `lcoverlay.dll`) and inside `cloud_redirect.dll`. When Selectively11 ships a CR build that restructures its data section, or Valve restructures Steam, those addresses can shift and the bridge will silently stop working. [`tools/refresh_offsets.py`](tools/refresh_offsets.py) automates the recovery — see [Refreshing offsets](#refreshing-offsets-after-cr-or-steam-updates) below. Note that this does **not** apply to CR's Steam-version whitelist, which is extracted live on every startup (see `src/version_check.cpp`).
-- **Load-order race with LumaCore.** crbridge polls up to 5 seconds for `lcoverlay.dll` to load before installing its hook. If LumaCore takes longer (rare), crbridge falls back to hooking the original `steamclient64.dll`, where Steam's runtime traffic doesn't actually go, and the bridge silently does nothing for that session. Restarting Steam usually resolves it.
-- **Steam beyond CR's whitelist still doesn't work.** crbridge now detects this case and logs `VersionCheck: status = NO MATCH` with a clear explanation, but it cannot make CR support a Steam build CR doesn't know about. When this happens, wait for a new CR release that adds the build, or roll Steam back to a supported one.
+- **CR ≥ 2.1.6 required.** Older CR builds don't have the `CR_InitCloudSave` export. crbridge logs a clear diagnostic and aborts in that case.
+- **Load-order race with LumaCore.** crbridge polls up to 5 s for `lcoverlay.dll` to load. If LumaCore takes longer, the IAT hook still installs but redirects `GetModuleHandleA("steamclient64.dll")` to the vanilla module (because lcoverlay isn't there yet). CR's lookup then walks empty memory and `CR_InitCloudSave` returns false. Restarting Steam usually wins the race.
+- **Steam beyond CR's whitelist still doesn't work.** crbridge detects and logs this via `VersionCheck`, but it can't make CR support a Steam build CR doesn't know about. Wait for a newer CR release or roll Steam back.
+- **Hook only covers `GetModuleHandleA`.** If a future CR build switches the runtime lookup to `GetModuleHandleW`, walks PEB module list manually, or uses some other mechanism, the IAT hook misses it and crbridge stops working. Diagnostic in the log will be `crbridge: CR_InitCloudSave returned false` with no IAT-related error — that's the smell.
 - **Single-account assumption.** Tested with one logged-in Steam user. Behavior with Family Sharing or fast user switching is unverified.
-
-## Refreshing offsets after CR or Steam updates
-
-CloudRedirect ships releases very frequently (≈ every 1-2 days; 27 releases over 45 days observed mid-2026), and its `.data` section moves with each one — empirically by 28 KB up to 600 KB between consecutive builds. When that happens, the 15 hard-coded constants in [`src/cr_patcher.cpp`](src/cr_patcher.cpp) become stale and crbridge stops working. Typical symptoms:
-
-- `CRPatcher: vtable mismatch ...` repeated in `crbridge.log`, never `PATCHED successfully`
-- `[INJECT] Cannot inject:` returns in `cloud_redirect.log`
-- Steam UI shows the cloud-sync error again
-
-[`tools/refresh_offsets.py`](tools/refresh_offsets.py) extracts all 15 constants directly from a fresh `cloud_redirect.dll` by anchoring on stable features (log format strings like `[INJECT] Cannot inject:` and `[CCM] Vtable mismatch at CUser+N`, the unique `lock cmpxchg byte` instruction, etc.) that survive across CR releases:
-
-```sh
-python tools/refresh_offsets.py "C:\Program Files (x86)\Steam\cloud_redirect.dll"
-```
-
-The script prints a paste-ready block of `constexpr uintptr_t` lines and compares them against the values currently in `src/cr_patcher.cpp`. If everything matches, the last line is `All extracted values MATCH what is currently in src/cr_patcher.cpp.` and there's nothing to do. If anything drifted, drifted lines are flagged inline:
-
-```
-constexpr uintptr_t CR_RVA_STEAMCLIENT_BASE  = 0x11FAB0;  // WAS 0x126C30 -- DRIFTED
-constexpr uintptr_t CR_RVA_CMINTERFACE       = 0x11FAC8;  // WAS 0x126C48 -- DRIFTED
-...
-At least one value has DRIFTED. Update src/cr_patcher.cpp before recompiling.
-```
-
-Workflow when this happens:
-
-1. Run the script against your installed `cloud_redirect.dll`.
-2. For each line marked `DRIFTED`, replace the corresponding `constexpr uintptr_t` line in `src/cr_patcher.cpp` with the new value.
-3. Commit and push — CI rebuilds and produces a fresh artifact.
-4. Deploy the new `crbridge.dll` over the old one.
-
-Whole cycle: well under a minute of attention, instead of the hour or two of manual `dumpbin /DISASM` it would take otherwise.
-
-**Tool limitations** (will be reported as `// X = NOT FOUND` in the output, never silently guessed):
-
-- Very old CR builds (pre-April 2026) may use different code patterns that the script's anchors don't match. For Category B / C entries, manual derivation may be needed in that case.
-- If Selectively11 renames or removes the log format strings the script anchors on (e.g. `[INJECT] Cannot inject:`), the corresponding extractions fail. Should be rare since those strings exist for developer diagnostics.
-- Pure stdlib — no `pip install` needed. Requires Python 3.6+.
 
 ## Building from source
 
@@ -133,15 +112,14 @@ Outputs:
 - `build/Release/crbridge.dll`
 - `build/proxy/Release/version.dll`
 
-Microsoft Detours is fetched via CMake `FetchContent`; no separate setup needed.
+No third-party dependencies — the iteration 9 use of Microsoft Detours is gone (no function hooks left to install).
 
 ## License
 
-GPLv3 — see [LICENSE](LICENSE). Same license as LumaCore, which crbridge intentionally mirrors (some pattern-matching and Detours conventions are adapted from LumaCore's `PatternDb.h`).
+GPLv3 — see [LICENSE](LICENSE). Same license as LumaCore.
 
 ## Credits
 
 - [Selectively11/CloudRedirect](https://github.com/Selectively11/CloudRedirect) — the cloud redirection engine that does all the actual work
-- [Midrags/SFF (SteaMidra + LumaCore)](https://github.com/Midrags/SFF) — the Steam injector ecosystem this is designed to coexist with; reference for hook patterns and the diversion technique
+- [Midrags/SFF (SteaMidra + LumaCore)](https://github.com/Midrags/SFF) — the Steam injector ecosystem this is designed to coexist with
 - [Hegxib/SteamTools-Deep-Analyze](https://github.com/Hegxib/SteamTools-Deep-Analyze) — static analysis of SteamTools' backdoor; motivation for this project
-- [Microsoft Detours](https://github.com/microsoft/Detours) — function hooking library, MIT-licensed

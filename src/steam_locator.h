@@ -1,26 +1,24 @@
 #pragma once
 #include <windows.h>
-#include <cstdint>
 
 namespace SteamLocator {
-    HMODULE WaitForSteamClient(int maxMs);
-    const void* FindServiceTransportRttiString();
 
-    const void* TypeDescriptorFromName(const void* nameAddr);
+// Block until steamclient64.dll loads (either Valve's own copy or the one
+// LumaCore loads as part of its proxy chain) or `maxMs` ms have passed.
+// Returns the module handle or nullptr on timeout.
+HMODULE WaitForSteamClient(int maxMs);
 
-    int FindColsReferencingTypeDescriptor(HMODULE module, const void* typeDescriptor,
-                                          const void** outResults, int maxResults);
+// Best-effort wait for the LumaCore diverted module — the renamed copy of
+// steamclient64.dll where Steam's runtime code actually executes. Modern
+// SteaMidra calls it `lcoverlay.dll`, the legacy name was `diversion.dll`.
+//
+// `outFoundName` (optional) receives a pointer to a static string with
+// the name that matched, useful for logging.
+//
+// Returns nullptr on timeout. Callers should treat that as "user isn't
+// running LumaCore" and proceed with the IAT hook installed anyway — the
+// hook will fall through to the original GetModuleHandleA, which keeps
+// behaviour correct in non-LumaCore environments.
+HMODULE WaitForDiversion(int maxMs, const char** outFoundName);
 
-    const void* FindVtableForCol(HMODULE module, const void* col);
-
-    void DumpVtable(const void* vtable, int n);
-
-    bool DiagnoseRTTI();
-
-    // === Iteration 7 ===
-    // Pattern format: "48 8B C4 55" (uppercase hex, space-separated). Use "??" for wildcards.
-    const void* FindPattern(const uint8_t* haystack, size_t haystackSize, const char* pattern);
-
-    // Find Steam's BBuildAndAsyncSendFrame using LumaCore's known patterns.
-    const void* FindBBuildAndAsyncSendFrame();
-}
+}  // namespace SteamLocator
