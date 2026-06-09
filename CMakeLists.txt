@@ -22,7 +22,6 @@ add_library(crbridge SHARED
     src/cr_loader.cpp
     src/cr_iat_hook.cpp
     src/steam_locator.cpp
-    src/version_check.cpp
 )
 
 target_compile_definitions(crbridge PRIVATE

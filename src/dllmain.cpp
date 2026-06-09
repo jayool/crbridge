@@ -21,7 +21,6 @@
 #include "cr_loader.h"
 #include "cr_iat_hook.h"
 #include "steam_locator.h"
-#include "version_check.h"
 
 namespace {
 
@@ -98,11 +97,7 @@ DWORD WINAPI InitThread(LPVOID) {
         return 0;
     }
 
-    // 4. Version check (diagnostic). Reads Steam's build id and CR's
-    //    whitelist, logs MATCH / NO MATCH. Doesn't abort either way.
-    VersionCheck::Run();
-
-    // 5. Install the IAT hook BEFORE CR_InitCloudSave so the very first
+    // 4. Install the IAT hook BEFORE CR_InitCloudSave so the very first
     //    GetModuleHandleA("steamclient64.dll") inside CR hits the redirect
     //    and the module base CR caches in g_steamClientBase is the
     //    diversion module's, not the original's.
@@ -113,7 +108,7 @@ DWORD WINAPI InitThread(LPVOID) {
         return 0;
     }
 
-    // 6. Initialize CR. From CR's perspective:
+    // 5. Initialize CR. From CR's perspective:
     //      GetModuleHandleA("steamclient64.dll") -> our hook -> lcoverlay
     //      g_steamClientBase = lcoverlay's base
     //      TryFindCCMInterface() walks lcoverlay -> finds the live CCMInterface
