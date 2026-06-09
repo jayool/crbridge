@@ -3,9 +3,13 @@ name: Build crbridge.dll
 on:
   push:
     branches: [main, 'refactor/**']
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: write  # needed by the release step on tag pushes
 
 jobs:
   build-windows:
@@ -26,8 +30,21 @@ jobs:
           Copy-Item build/Release/crbridge.dll artifact/
           Copy-Item build/proxy/Release/version.dll artifact/
 
+      - name: Zip artifact for release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: Compress-Archive -Path artifact/* -DestinationPath crbridge.zip
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v5
         with:
           name: crbridge
           path: artifact/
+
+      - name: Create release on tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: crbridge.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
