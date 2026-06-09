@@ -35,7 +35,7 @@ Tested with Steam stable on 64-bit Windows. Steam **must be closed** when you co
 
 2. **CloudRedirect** (v2.1.6 or newer). Drop `cloud_redirect.dll` next to `steam.exe` and authenticate a cloud provider via CR's app. The app writes its own `config.json` when you sign in — no manual editing required.
 
-3. **crbridge**. Download the latest `crbridge` artifact zip from this repo's [Actions](../../actions) tab:
+3. **crbridge**. Download `crbridge.zip` from the latest [Release](../../releases/latest):
 
    ```
    crbridge.zip
@@ -137,7 +137,7 @@ On `DLL_PROCESS_DETACH` we call `CR_Shutdown` (best-effort) so CR can drain pend
 
 ## Build infrastructure
 
-CI (`.github/workflows/build.yml`) builds on every push to `main`. The easiest path is to download the `crbridge` artifact from the latest successful run under the [Actions](../../actions) tab.
+CI (`.github/workflows/build.yml`) builds on every push to `main` and publishes a Release with `crbridge.zip` attached whenever a `v*` tag is pushed. The recommended path is to download the latest [Release](../../releases/latest); the per-push [Actions](../../actions) artifacts are also available but expire after 90 days.
 
 To build locally on Windows with Visual Studio 2022 + CMake 3.20+:
 
