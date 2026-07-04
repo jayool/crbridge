@@ -2,7 +2,7 @@ name: Build crbridge.dll
 
 on:
   push:
-    branches: [main, 'refactor/**']
+    branches: [main, 'refactor/**', 'claude/**']
     tags: ['v*']
   pull_request:
     branches: [main]
@@ -13,7 +13,9 @@ permissions:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    # windows-latest dropped the VS2022 instance the CMake generator expects;
+    # pin to the image that still ships Visual Studio 2022.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v5
 

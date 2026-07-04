@@ -17,7 +17,7 @@ CR ≥ 2.1.6 exposes a public C API (`CR_InitCloudSave`, `CR_HandleCloudRpc`, `C
 |---|---|
 | **`version.dll` proxy** | Side-by-side DLL that Steam loads automatically at startup. Its only job is to `LoadLibrary` on `crbridge.dll`. |
 | **IAT hook on `GetModuleHandleA`** | When CR's internal lookup calls `GetModuleHandleA("steamclient64.dll")`, we redirect it to LumaCore's diverted module (`lcoverlay.dll`, with `diversion.dll` fallback) so CR's RVA arithmetic resolves the live runtime instead of the dormant vanilla copy. |
-| **`CR_InitCloudSave` call** | After the IAT hook is in place, crbridge calls CR's public init function. CR self-installs vtable hooks on the cloud RPC path and starts intercepting. |
+| **`CR_InitCloudSave` + `CR_InstallVtableHooks`** | After the IAT hook is in place, crbridge calls CR's init function, then arms the cloud-RPC interception via `CR_InstallVtableHooks`. CR ≥ 2.2.5 no longer installs the hooks inside `CR_InitCloudSave`, so this second call is what makes CR actually intercept; on older CR (≤ 2.1.x) the export is absent and crbridge skips it (that CR self-installs). |
 
 Division of labour:
 
@@ -112,7 +112,7 @@ CR also writes its own log next to its DLL — check there for further detail.
 
 ### The problem with CR ≥ 2.1.6 in a LumaCore environment
 
-CR exposes `CR_InitCloudSave(steamPath, notifyCallback)` as the canonical entry point. CR's implementation does the heavy lifting internally: it calls `GetModuleHandleA("steamclient64.dll")`, walks Steam's `CSteamEngine` global to find the current `CCMInterface`, and installs its own vtable hooks on the cloud RPC dispatcher.
+CR exposes `CR_InitCloudSave(steamPath, notifyCallback)` as the canonical entry point. CR's implementation does the heavy lifting internally: it calls `GetModuleHandleA("steamclient64.dll")` and walks Steam's `CSteamEngine` global to find the current `CCMInterface`. (On CR ≥ 2.2.5 the cloud-RPC vtable hooks are armed by a separate `CR_InstallVtableHooks` call rather than inside `CR_InitCloudSave` — see the sequence above.)
 
 In a LumaCore-diverted Steam, the runtime code executes from `lcoverlay.dll` — a renamed copy of `steamclient64.dll` where LumaCore installs its own hooks. The vanilla `steamclient64.dll` is still loaded into the process (`GetModuleHandleA` returns its handle happily) but no live runtime objects exist there. CR walks the empty module, doesn't find CCMInterface, and `CR_InitCloudSave` returns `false`.
 
@@ -129,9 +129,10 @@ CR doesn't know it was redirected. From CR's perspective, `steamclient64.dll` si
 
 1. `version.dll` proxy in the Steam directory loads at process startup. It calls `LoadLibrary` on `crbridge.dll`.
 2. `crbridge.dll`'s `InitThread` waits for `steamclient64.dll` to load (up to 10s) and best-effort waits for the LumaCore diversion module (5s).
-3. Loads `cloud_redirect.dll` from the Steam directory; falls back to the system search path. Resolves `CR_InitCloudSave`, `CR_SetApps`, `CR_Shutdown` via `GetProcAddress`. Aborts if `CR_InitCloudSave` is missing.
+3. Loads `cloud_redirect.dll` from the Steam directory; falls back to the system search path. Resolves `CR_InitCloudSave`, `CR_SetApps`, `CR_Shutdown` and `CR_InstallVtableHooks` via `GetProcAddress`. Aborts if `CR_InitCloudSave` is missing; the rest are best-effort.
 4. Installs the IAT hook on cloud_redirect.dll's `GetModuleHandleA` import.
-5. Calls `CR_InitCloudSave(steamPath, nullptr)`. CR self-installs the rest.
+5. Calls `CR_InitCloudSave(steamPath, nullptr)`.
+6. Calls `CR_InstallVtableHooks()` to arm the cloud-RPC interception. CR ≥ 2.2.5 moved this out of `CR_InitCloudSave`, so without this call CR initializes but never intercepts a single cloud RPC. If the export is absent (pre-2.2.5 CR), crbridge skips it — that CR still installs the hook inside `CR_InitCloudSave`.
 
 On `DLL_PROCESS_DETACH` we call `CR_Shutdown` (best-effort) so CR can drain pending HTTP work and close sockets cleanly.
 

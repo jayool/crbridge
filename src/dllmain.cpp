@@ -141,8 +141,36 @@ DWORD WINAPI InitThread(LPVOID) {
         return 0;
     }
 
-    LogLine("crbridge: CR_InitCloudSave succeeded — CR is now active. "
-            "Cloud RPCs for namespace apps will be redirected to your configured provider.");
+    LogLine("crbridge: CR_InitCloudSave succeeded.");
+
+    // 6. Arm CR's cloud-RPC interception.
+    //
+    //    CR >= 2.2.5 split the vtable-hook installation out of CR_InitCloudSave
+    //    into its own export, CR_InstallVtableHooks. On those builds
+    //    CR_InitCloudSave only wires up storage / provider / namespace
+    //    detection; the interception hook that actually catches the game's
+    //    cloud RPCs must be armed explicitly, or CR sits initialized-but-idle
+    //    and never redirects a single save. (This is exactly what silently
+    //    broke crbridge when CR moved past the v2.1.6 API, where
+    //    CR_InitCloudSave installed the hook itself.)
+    //
+    //    Older CR (<= 2.1.x) has no such export — GetInstallVtableHooks()
+    //    returns null and we skip this step, because that CR already armed the
+    //    hook inside CR_InitCloudSave.
+    if (auto installHooks = CRLoader::GetInstallVtableHooks()) {
+        bool hooked = installHooks();
+        snprintf(line, sizeof(line),
+            "crbridge: CR_InstallVtableHooks() -> %s",
+            hooked ? "hooks ACTIVE — cloud RPCs for namespace apps will be "
+                     "intercepted and redirected to your configured provider"
+                   : "returned false — transport vtable not hooked; check "
+                     "cloud_redirect.log (CR may not have resolved it yet)");
+        LogLine(line);
+    } else {
+        LogLine("crbridge: CR_InstallVtableHooks not exported — assuming this CR arms the "
+                "hook inside CR_InitCloudSave (pre-2.2.5 behaviour). If saves don't sync, "
+                "update cloud_redirect.dll to 2.2.5+.");
+    }
     return 0;
 }
 

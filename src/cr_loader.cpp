@@ -7,6 +7,7 @@ namespace {
     CRLoader::CR_InitCloudSave_t g_initCloudSave = nullptr;
     CRLoader::CR_SetApps_t       g_setApps       = nullptr;
     CRLoader::CR_Shutdown_t      g_shutdown      = nullptr;
+    CRLoader::CR_InstallVtableHooks_t g_installVtableHooks = nullptr;
 
     void LogLine(const char* msg) {
         char tempDir[MAX_PATH] = {};
@@ -73,6 +74,7 @@ bool TryLoad() {
     g_initCloudSave = (CR_InitCloudSave_t)GetProcAddress(g_crModule, "CR_InitCloudSave");
     g_setApps       = (CR_SetApps_t)      GetProcAddress(g_crModule, "CR_SetApps");
     g_shutdown      = (CR_Shutdown_t)     GetProcAddress(g_crModule, "CR_Shutdown");
+    g_installVtableHooks = (CR_InstallVtableHooks_t)GetProcAddress(g_crModule, "CR_InstallVtableHooks");
 
     // CR_InitCloudSave is the only hard requirement. Without it we can't
     // boot CR at all. The other two are best-effort: SetApps is only
@@ -90,10 +92,14 @@ bool TryLoad() {
     if (!g_shutdown) {
         LogLine("CRLoader: CR_Shutdown export not found (continuing — DLL_PROCESS_DETACH will skip the clean-shutdown call)");
     }
+    if (!g_installVtableHooks) {
+        LogLine("CRLoader: CR_InstallVtableHooks export not found — this looks like a pre-2.2.5 CR "
+                "that arms the interception hook inside CR_InitCloudSave (continuing).");
+    }
 
     snprintf(buf, sizeof(buf),
-        "CRLoader: resolved API: CR_InitCloudSave=%p CR_SetApps=%p CR_Shutdown=%p",
-        (void*)g_initCloudSave, (void*)g_setApps, (void*)g_shutdown);
+        "CRLoader: resolved API: CR_InitCloudSave=%p CR_SetApps=%p CR_Shutdown=%p CR_InstallVtableHooks=%p",
+        (void*)g_initCloudSave, (void*)g_setApps, (void*)g_shutdown, (void*)g_installVtableHooks);
     LogLine(buf);
     return true;
 }
@@ -101,6 +107,7 @@ bool TryLoad() {
 CR_InitCloudSave_t GetInitCloudSave() { return g_initCloudSave; }
 CR_SetApps_t       GetSetApps()       { return g_setApps; }
 CR_Shutdown_t      GetShutdown()      { return g_shutdown; }
+CR_InstallVtableHooks_t GetInstallVtableHooks() { return g_installVtableHooks; }
 HMODULE            GetModule()        { return g_crModule; }
 
 }  // namespace CRLoader
