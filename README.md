@@ -4,22 +4,6 @@ A 64-bit Windows DLL that boots [CloudRedirect](https://github.com/Selectively11
 
 > ⚠️ **Educational / research use only.** Use it with your own Steam account and content. Do not redistribute Valve binaries. This repo is only the bootstrap loader that lets an unmodified upstream CloudRedirect run without SteamTools.
 
-## What it does
-
-crbridge is a host for CR's public C API. It plugs three pieces together:
-
-| Piece | Role |
-|---|---|
-| **`version.dll` proxy** | Side-by-side DLL Steam auto-loads at startup. Its only job: `LoadLibrary` on `crbridge.dll`. |
-| **IAT hook on `GetModuleHandleA`** | Redirects CR's `GetModuleHandleA("steamclient64.dll")` to LumaCore's diverted module (`lcoverlay.dll`, `diversion.dll` fallback) so CR resolves the live runtime, not the dormant vanilla copy. |
-| **`CR_InitCloudSave` + `CR_InstallVtableHooks`** | Boots CR, then arms the cloud-RPC interception. CR ≥ 2.2.5 needs the second call to intercept anything; older CR self-installs and crbridge skips it. |
-
-Division of labour — the three are orthogonal:
-
-- **LumaCore** (via SteaMidra) → ownership / licensing layer (game appears as owned).
-- **crbridge** → loads and drives CR; the IAT redirect.
-- **CloudRedirect** → cloud-save RPC interception, redirected to Google Drive / OneDrive / local folder.
-
 ## Installation
 
 Steam **must be closed** when you copy the DLLs.
@@ -37,6 +21,22 @@ Steam **must be closed** when you copy the DLLs.
 - **CloudRedirect v2.1.6+** (older builds lack the `CR_InitCloudSave` export).
 - **SteaMidra current** (`lcoverlay.dll`); legacy `diversion.dll` builds work as a fallback.
 - Other Steam channels and LumaCore-derived projects should work but are untested.
+
+## What it does
+
+crbridge is a host for CR's public C API. It plugs three pieces together:
+
+| Piece | Role |
+|---|---|
+| **`version.dll` proxy** | Side-by-side DLL Steam auto-loads at startup. Its only job: `LoadLibrary` on `crbridge.dll`. |
+| **IAT hook on `GetModuleHandleA`** | Redirects CR's `GetModuleHandleA("steamclient64.dll")` to LumaCore's diverted module (`lcoverlay.dll`, `diversion.dll` fallback) so CR resolves the live runtime, not the dormant vanilla copy. |
+| **`CR_InitCloudSave` + `CR_InstallVtableHooks`** | Boots CR, then arms the cloud-RPC interception. CR ≥ 2.2.5 needs the second call to intercept anything; older CR self-installs and crbridge skips it. |
+
+Division of labour — the three are orthogonal:
+
+- **LumaCore** (via SteaMidra) → ownership / licensing layer (game appears as owned).
+- **crbridge** → loads and drives CR; the IAT redirect.
+- **CloudRedirect** → cloud-save RPC interception, redirected to Google Drive / OneDrive / local folder.
 
 ## Troubleshooting
 
